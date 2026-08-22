@@ -34,8 +34,11 @@ class RagfsBindingConfig:
 
     def to_binding_dict(self) -> Dict[str, Any]:
         """Convert the runtime config into the sectioned dict consumed by `RAGFSBindingClient`."""
+        cache_config = self.agfs.cache.model_dump(mode="json")
+        if getattr(getattr(self.agfs, "queuefs", None), "backend", None) == "cache":
+            cache_config["runtime_enabled"] = True
         binding_config: Dict[str, Any] = {
-            "cache": self.agfs.cache.model_dump(mode="json"),
+            "cache": cache_config,
             "pathlock": self.agfs.pathlock.model_dump(mode="json"),
         }
 
@@ -195,6 +198,9 @@ def _build_queuefs_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str,
 
     if backend == "redis":
         plugin_config["redis"] = queuefs_config.redis.model_dump()
+
+    if backend == "cache":
+        plugin_config["cache_key_prefix"] = queuefs_config.cache_key_prefix
 
     return plugin_config
 

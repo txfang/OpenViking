@@ -188,44 +188,41 @@ def test_agfs_queuefs_validation_rejects_invalid_shapes(queuefs, match):
         AGFSConfig(path="/tmp/ov-test", backend="local", queuefs=queuefs)
 
 
-def test_agfs_cache_defaults_to_disabled_memory_provider():
+def test_agfs_cache_defaults_to_disabled_redis_provider():
     config = AGFSConfig(path="/tmp/ov-test", backend="local")
 
     assert config.cache.enabled is False
-    assert config.cache.provider == "memory"
+    assert config.cache.provider == "redis"
     assert config.cache.namespace == "openviking"
     assert config.cache.traversal_mode == "backend"
 
 
-def test_agfs_cache_accepts_yuanrong_provider_config():
+def test_agfs_cache_accepts_dynamic_provider_config():
     config = AGFSConfig(
         path="/tmp/ov-test",
         backend="local",
         cache={
             "enabled": True,
-            "provider": "yuanrong",
+            "provider": "dynamic",
             "namespace": "ov-test",
             "max_file_size_bytes": 4096,
             "traversal_mode": "cached_traversal",
             "bypass_prefixes": ["/queue"],
-            "yuanrong": {
-                "host": "10.0.0.1",
-                "port": 31501,
-                "connect_timeout_ms": 1000,
-                "request_timeout_ms": 2000,
-                "sdk_concurrency": 2,
+            "dynamic": {
+                "library": "/opt/openviking/libprovider.so",
+                "params": {"endpoint": "provider:1234"},
             },
         },
     )
 
     assert config.cache.enabled is True
-    assert config.cache.provider == "yuanrong"
+    assert config.cache.provider == "dynamic"
     assert config.cache.namespace == "ov-test"
     assert config.cache.max_file_size_bytes == 4096
     assert config.cache.traversal_mode == "cached_traversal"
     assert config.cache.bypass_prefixes == ["/queue"]
-    assert config.cache.yuanrong.host == "10.0.0.1"
-    assert config.cache.yuanrong.sdk_concurrency == 2
+    assert config.cache.dynamic.library == "/opt/openviking/libprovider.so"
+    assert config.cache.dynamic.params == {"endpoint": "provider:1234"}
 
 
 def test_agfs_cache_accepts_redis_provider_config():
@@ -242,7 +239,7 @@ def test_agfs_cache_accepts_redis_provider_config():
                 "pool_size": 8,
                 "connect_timeout_ms": 1000,
                 "command_timeout_ms": 20,
-                "key_prefix": "ragfs-cache",
+                "key_prefix": "",
                 "default_ttl_seconds": 3600,
                 "read_from_replica": False,
             },
@@ -255,6 +252,19 @@ def test_agfs_cache_accepts_redis_provider_config():
     assert config.cache.redis.endpoints == ["redis://127.0.0.1:6379"]
     assert config.cache.redis.pool_size == 8
     assert config.cache.redis.default_ttl_seconds == 3600
+
+
+def test_agfs_cache_rejects_redis_provider_key_prefix_when_enabled():
+    with pytest.raises(ValueError, match="key_prefix"):
+        AGFSConfig(
+            path="/tmp/ov-test",
+            backend="local",
+            cache={
+                "enabled": True,
+                "provider": "redis",
+                "redis": {"key_prefix": "provider-prefix"},
+            },
+        )
 
 
 def test_agfs_cache_rejects_invalid_provider():
@@ -711,7 +721,7 @@ def test_ragfs_binding_config_builds_single_binding_dict_for_local_backend(tmp_p
         backend="local",
         cache={
             "enabled": True,
-            "provider": "memory",
+            "provider": "redis",
             "namespace": "runtime-cache",
         },
     )
@@ -736,6 +746,20 @@ def test_ragfs_binding_config_builds_single_binding_dict_for_local_backend(tmp_p
     }
 
 
+def test_ragfs_binding_enables_runtime_for_queuefs_cache_backend(tmp_path):
+    agfs_config = AGFSConfig(
+        path=str(tmp_path),
+        backend="local",
+        cache={"enabled": False, "provider": "redis"},
+        queuefs={"backend": "cache", "cache_key_prefix": "queue-runtime"},
+    )
+
+    binding = RagfsBindingConfig(agfs=agfs_config).to_binding_dict()
+
+    assert binding["cache"]["enabled"] is False
+    assert binding["cache"]["runtime_enabled"] is True
+
+
 def test_agfs_pathlock_config_validates_provider_and_expiry(tmp_path):
     """PathLock config accepts built-ins and rejects unsafe expiry values."""
     config = AGFSConfig(
@@ -757,7 +781,7 @@ def test_create_agfs_client_uses_single_binding_config_object(monkeypatch, tmp_p
     agfs_config = AGFSConfig(
         path=str(tmp_path),
         backend="memory",
-        cache={"enabled": True, "provider": "memory", "namespace": "runtime-cache"},
+        cache={"enabled": True, "provider": "redis", "namespace": "runtime-cache"},
     )
 
     def _fake_get_binding_client():

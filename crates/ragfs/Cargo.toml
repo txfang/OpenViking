@@ -23,6 +23,21 @@ name = "cache_wrapper"
 path = "tests/cache_wrapper.rs"
 required-features = ["cache"]
 
+[[test]]
+name = "cache_runtime"
+path = "tests/cache_runtime.rs"
+required-features = ["cache"]
+
+[[test]]
+name = "redis_runtime"
+path = "tests/redis_runtime.rs"
+required-features = ["cache"]
+
+[[test]]
+name = "dynamic_provider"
+path = "tests/dynamic_provider.rs"
+required-features = ["cache"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }
@@ -84,6 +99,8 @@ lru = "0.12"
 regex = "1.10"
 mime_guess = "2.0"
 globset = "0.4"
+url = "2.5"
+libloading = { version = "0.8", optional = true }
 
 # Encryption (envelope encryption: AES-256-GCM + HKDF-SHA256)
 aes-gcm = "0.10"
@@ -120,6 +137,6 @@ uuid = { version = "1.0", features = ["v4"] }
 
 [features]
 default = []
-cache = []
+cache = ["dep:libloading"]
 s3 = ["aws-sdk-s3", "aws-config", "aws-types"]
 full = ["s3", "cache"]

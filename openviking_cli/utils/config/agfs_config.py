@@ -193,7 +193,7 @@ class QueueFSConfig(BaseModel):
 
     backend: str = Field(
         default="sqlite",
-        description="QueueFS backend: 'memory' | 'sqlite' | 'sqlite3' | 'redis'",
+        description="QueueFS backend: 'memory' | 'sqlite' | 'sqlite3' | 'redis' | 'cache'",
     )
 
     db_path: Optional[str] = Field(
@@ -213,6 +213,11 @@ class QueueFSConfig(BaseModel):
 
     redis: QueueFSRedisConfig = Field(default_factory=QueueFSRedisConfig)
 
+    cache_key_prefix: str = Field(
+        default="default",
+        description="Queue key namespace when backend is 'cache'.",
+    )
+
     model_config = {"extra": "forbid"}
 
     @model_validator(mode="after")
@@ -221,25 +226,32 @@ class QueueFSConfig(BaseModel):
         if self.mode not in valid_modes:
             raise ValueError("queuefs mode must be one of: 'shared', 'worker'")
 
-        valid_backends = {"memory", "sqlite", "sqlite3", "redis"}
+        valid_backends = {"memory", "sqlite", "sqlite3", "redis", "cache"}
         if self.backend not in valid_backends:
             raise ValueError(
-                "queuefs backend must be one of: 'memory', 'sqlite', 'sqlite3', 'redis'"
+                "queuefs backend must be one of: 'memory', 'sqlite', 'sqlite3', 'redis', 'cache'"
             )
         if self.recover_stale_sec < 0:
             raise ValueError("queuefs recover_stale_sec must be >= 0")
         if self.busy_timeout_ms < 0:
             raise ValueError("queuefs busy_timeout_ms must be >= 0")
+        if not self.cache_key_prefix.strip() or any(
+            marker in self.cache_key_prefix for marker in ("{", "}")
+        ):
+            raise ValueError(
+                "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
+            )
         return self
 
 
 class AGFSCacheProvider(str, Enum):
     """Cache providers supported by RAGFS."""
 
+    REDIS = "redis"
+    DYNAMIC = "dynamic"
     MEMORY = "memory"
     YUANRONG = "yuanrong"
     MOONCAKE = "mooncake"
-    REDIS = "redis"
 
 
 class AGFSCacheTraversalMode(str, Enum):
@@ -249,72 +261,13 @@ class AGFSCacheTraversalMode(str, Enum):
     CACHED_TRAVERSAL = "cached_traversal"
 
 
-class YuanrongCacheConfig(BaseModel):
-    """Configuration for Yuanrong cache provider."""
+class DynamicCacheConfig(BaseModel):
+    """Configuration passed to a versioned dynamic cache provider."""
 
-    host: str = Field(default="127.0.0.1", description="Yuanrong worker host")
-    port: int = Field(default=31501, description="Yuanrong worker port")
-    connect_timeout_ms: int = Field(default=5000, description="Yuanrong connect timeout")
-    request_timeout_ms: int = Field(default=5000, description="Yuanrong request timeout")
-    sdk_concurrency: int = Field(default=4, description="Yuanrong SDK concurrency")
+    library: str = Field(default="", description="Provider dynamic library path")
+    params: dict[str, Any] = Field(default_factory=dict, description="Provider-owned parameters")
 
     model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        if not self.host.strip():
-            raise ValueError("yuanrong host must not be empty")
-        if self.port <= 0 or self.port > 65535:
-            raise ValueError("yuanrong port must be between 1 and 65535")
-        if self.connect_timeout_ms <= 0:
-            raise ValueError("yuanrong connect_timeout_ms must be > 0")
-        if self.request_timeout_ms <= 0:
-            raise ValueError("yuanrong request_timeout_ms must be > 0")
-        if self.sdk_concurrency <= 0:
-            raise ValueError("yuanrong sdk_concurrency must be > 0")
-        return self
-
-
-class MooncakeCacheConfig(BaseModel):
-    """Configuration for Mooncake cache provider."""
-
-    local_hostname: str = Field(default="127.0.0.1", description="Mooncake local hostname")
-    metadata_server: str = Field(
-        default="http://127.0.0.1:8080/metadata",
-        description="Mooncake metadata server",
-    )
-    master_server_addr: str = Field(
-        default="127.0.0.1:50051",
-        description="Mooncake master server address",
-    )
-    protocol: str = Field(default="tcp", description="Mooncake transfer protocol")
-    device_name: str = Field(default="", description="Mooncake transport device name")
-    global_segment_size: int = Field(default=512 << 20, description="Mooncake global segment size")
-    local_buffer_size: int = Field(default=128 << 20, description="Mooncake local buffer size")
-    replica_num: int = Field(default=2, description="Mooncake replica count")
-    sdk_concurrency: int = Field(default=4, description="Mooncake SDK concurrency")
-    operation_timeout_ms: int = Field(default=5000, description="Mooncake operation timeout")
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        for name in ("local_hostname", "metadata_server", "master_server_addr", "protocol"):
-            if not getattr(self, name).strip():
-                raise ValueError(f"mooncake {name} must not be empty")
-        if self.protocol not in {"tcp", "rdma", "ascend", "cxl", "nvlink", "barex"}:
-            raise ValueError("mooncake protocol is unsupported")
-        if self.global_segment_size <= 0:
-            raise ValueError("mooncake global_segment_size must be > 0")
-        if self.local_buffer_size <= 0:
-            raise ValueError("mooncake local_buffer_size must be > 0")
-        if self.replica_num <= 0:
-            raise ValueError("mooncake replica_num must be > 0")
-        if self.sdk_concurrency <= 0:
-            raise ValueError("mooncake sdk_concurrency must be > 0")
-        if self.operation_timeout_ms <= 0:
-            raise ValueError("mooncake operation_timeout_ms must be > 0")
-        return self
 
 
 class RedisCacheConfig(BaseModel):
@@ -330,7 +283,10 @@ class RedisCacheConfig(BaseModel):
     pool_size: int = Field(default=32, description="Redis command concurrency")
     connect_timeout_ms: int = Field(default=1000, description="Redis connect timeout")
     command_timeout_ms: int = Field(default=20, description="Redis command timeout")
-    key_prefix: str = Field(default="ragfs-cache", description="Redis cache key prefix")
+    key_prefix: str = Field(
+        default="",
+        description="Reserved compatibility field; unified Runtime requires an empty value",
+    )
     default_ttl_seconds: int = Field(default=3600, description="Redis default cache TTL")
     read_from_replica: bool = Field(default=False, description="Read from Redis replicas")
 
@@ -350,8 +306,6 @@ class RedisCacheConfig(BaseModel):
             raise ValueError("redis connect_timeout_ms must be > 0")
         if self.command_timeout_ms <= 0:
             raise ValueError("redis command_timeout_ms must be > 0")
-        if not self.key_prefix.strip():
-            raise ValueError("redis key_prefix must not be empty")
         if self.default_ttl_seconds < 0:
             raise ValueError("redis default_ttl_seconds must be >= 0")
         if self.read_from_replica:
@@ -364,7 +318,7 @@ class AGFSCacheConfig(BaseModel):
 
     enabled: bool = Field(default=False, description="Enable RAGFS cache")
     provider: AGFSCacheProvider = Field(
-        default=AGFSCacheProvider.MEMORY,
+        default=AGFSCacheProvider.REDIS,
         description="RAGFS cache provider",
     )
     namespace: str = Field(default="openviking", description="RAGFS cache namespace")
@@ -380,9 +334,8 @@ class AGFSCacheConfig(BaseModel):
         default_factory=list,
         description="Path prefixes that bypass cache",
     )
-    yuanrong: YuanrongCacheConfig = Field(default_factory=YuanrongCacheConfig)
-    mooncake: MooncakeCacheConfig = Field(default_factory=MooncakeCacheConfig)
     redis: RedisCacheConfig = Field(default_factory=RedisCacheConfig)
+    dynamic: DynamicCacheConfig = Field(default_factory=DynamicCacheConfig)
 
     model_config = {"extra": "forbid"}
 
@@ -392,6 +345,19 @@ class AGFSCacheConfig(BaseModel):
             raise ValueError("cache namespace must not be empty")
         if self.max_file_size_bytes <= 0:
             raise ValueError("cache max_file_size_bytes must be > 0")
+        if self.enabled and self.provider not in {
+            AGFSCacheProvider.REDIS,
+            AGFSCacheProvider.DYNAMIC,
+        }:
+            raise ValueError("enabled cache provider must be 'redis' or 'dynamic'")
+        if self.enabled and self.provider == AGFSCacheProvider.DYNAMIC:
+            if not self.dynamic.library.strip():
+                raise ValueError("dynamic cache library must not be empty")
+        if self.enabled and self.provider == AGFSCacheProvider.REDIS:
+            if self.redis.key_prefix:
+                raise ValueError(
+                    "redis cache key_prefix must be empty because Runtime keys are fully qualified"
+                )
         return self
 
 

@@ -11,6 +11,8 @@
 //! - `/queue_name/ack` - Write message ID to this file to acknowledge and delete it
 
 mod backend;
+#[cfg(feature = "cache")]
+mod cache_backend;
 mod redis_backend;
 
 use crate::core::{
@@ -21,6 +23,8 @@ use crate::core::{
 };
 use async_trait::async_trait;
 use backend::{MemoryBackend, Message, QueueBackend, SQLiteQueueBackend, SQLiteQueueOptions};
+#[cfg(feature = "cache")]
+use cache_backend::CacheQueueStorage;
 use redis_backend::RedisQueueBackend;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -77,6 +81,8 @@ enum BackendKind {
     Memory,
     Sqlite,
     Redis,
+    #[cfg(feature = "cache")]
+    Cache,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +91,8 @@ struct ParsedBackendConfig {
     sqlite_db_path: Option<String>,
     sqlite_options: SQLiteQueueOptions,
     redis_options: Option<RedisQueueOptions>,
+    #[cfg(feature = "cache")]
+    cache_key_prefix: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
@@ -263,10 +271,105 @@ struct ParsedPath {
     is_dir: bool,
 }
 
+enum QueueStorage {
+    Local(Arc<Mutex<Box<dyn QueueBackend>>>),
+    #[cfg(feature = "cache")]
+    Cache(Arc<CacheQueueStorage>),
+}
+
+impl QueueStorage {
+    async fn create_queue(&self, name: &str) -> Result<()> {
+        match self {
+            Self::Local(backend) => backend.lock().await.create_queue(name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.create_queue(name).await,
+        }
+    }
+
+    async fn remove_queue(&self, name: &str) -> Result<()> {
+        match self {
+            Self::Local(backend) => backend.lock().await.remove_queue(name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.remove_queue(name).await,
+        }
+    }
+
+    async fn queue_exists(&self, name: &str) -> bool {
+        match self {
+            Self::Local(backend) => backend.lock().await.queue_exists(name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.queue_exists(name).await,
+        }
+    }
+
+    async fn list_queues(&self, prefix: &str) -> Vec<String> {
+        match self {
+            Self::Local(backend) => backend.lock().await.list_queues(prefix),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.list_queues(prefix).await,
+        }
+    }
+
+    async fn enqueue(&self, queue_name: &str, message: Message) -> Result<()> {
+        match self {
+            Self::Local(backend) => backend.lock().await.enqueue(queue_name, message),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.enqueue(queue_name, message).await,
+        }
+    }
+
+    async fn dequeue(&self, queue_name: &str) -> Result<Option<Message>> {
+        match self {
+            Self::Local(backend) => backend.lock().await.dequeue(queue_name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.dequeue(queue_name).await,
+        }
+    }
+
+    async fn peek(&self, queue_name: &str) -> Result<Option<Message>> {
+        match self {
+            Self::Local(backend) => backend.lock().await.peek(queue_name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.peek(queue_name).await,
+        }
+    }
+
+    async fn size(&self, queue_name: &str) -> Result<usize> {
+        match self {
+            Self::Local(backend) => backend.lock().await.size(queue_name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.size(queue_name).await,
+        }
+    }
+
+    async fn list_unacked(&self, queue_name: &str) -> Result<Vec<Message>> {
+        match self {
+            Self::Local(backend) => backend.lock().await.list_unacked(queue_name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.list_unacked(queue_name).await,
+        }
+    }
+
+    async fn clear(&self, queue_name: &str) -> Result<()> {
+        match self {
+            Self::Local(backend) => backend.lock().await.clear(queue_name),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.clear(queue_name).await,
+        }
+    }
+
+    async fn ack(&self, queue_name: &str, message_id: &str) -> Result<bool> {
+        match self {
+            Self::Local(backend) => backend.lock().await.ack(queue_name, message_id),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.ack(queue_name, message_id).await,
+        }
+    }
+}
+
 /// QueueFS - A filesystem-based message queue with multi-queue support
 pub struct QueueFileSystem {
-    /// The queue backend
-    backend: Arc<Mutex<Box<dyn QueueBackend>>>,
+    storage: QueueStorage,
 }
 
 impl QueueFileSystem {
@@ -278,8 +381,20 @@ impl QueueFileSystem {
     /// Create a QueueFileSystem with a specific backend implementation.
     pub fn with_backend(backend: Box<dyn QueueBackend>) -> Self {
         Self {
-            backend: Arc::new(Mutex::new(backend)),
+            storage: QueueStorage::Local(Arc::new(Mutex::new(backend))),
         }
+    }
+
+    #[cfg(feature = "cache")]
+    pub(crate) async fn with_cache_runtime(
+        runtime: Arc<crate::cache_runtime::CacheRuntime>,
+        key_prefix: String,
+    ) -> Result<Self> {
+        Ok(Self {
+            storage: QueueStorage::Cache(Arc::new(
+                CacheQueueStorage::open(runtime, key_prefix).await?,
+            )),
+        })
     }
 
     /// Check if a name is a control operation
@@ -380,7 +495,7 @@ impl FileSystem for QueueFileSystem {
             return Err(Error::InvalidOperation("not a directory path".to_string()));
         }
         if let Some(queue_name) = parsed.queue_name {
-            self.backend.lock().await.create_queue(&queue_name)?;
+            self.storage.create_queue(&queue_name).await?;
             Ok(())
         } else {
             // Root directory always exists
@@ -398,11 +513,9 @@ impl FileSystem for QueueFileSystem {
             .operation
             .ok_or_else(|| Error::InvalidOperation("no operation specified".to_string()))?;
 
-        let mut backend = self.backend.lock().await;
-
         match operation.as_str() {
             "dequeue" => {
-                let Some(msg) = backend.dequeue(&queue_name)? else {
+                let Some(msg) = self.storage.dequeue(&queue_name).await? else {
                     return Ok(b"{}".to_vec());
                 };
                 // Return in Go libagfsbinding format: {"id": "...", "data": "..."}
@@ -414,7 +527,7 @@ impl FileSystem for QueueFileSystem {
                 Ok(serde_json::to_vec(&response)?)
             }
             "peek" => {
-                let Some(msg) = backend.peek(&queue_name)? else {
+                let Some(msg) = self.storage.peek(&queue_name).await? else {
                     return Ok(b"{}".to_vec());
                 };
                 // Return in Go libagfsbinding format: {"id": "...", "data": "..."}
@@ -426,12 +539,14 @@ impl FileSystem for QueueFileSystem {
                 Ok(serde_json::to_vec(&response)?)
             }
             "size" => {
-                let size = backend.size(&queue_name)?;
+                let size = self.storage.size(&queue_name).await?;
                 Ok(size.to_string().into_bytes())
             }
             "messages" => {
-                let messages = backend
-                    .list_unacked(&queue_name)?
+                let messages = self
+                    .storage
+                    .list_unacked(&queue_name)
+                    .await?
                     .into_iter()
                     .map(|msg| QueueMessage {
                         id: msg.id,
@@ -457,22 +572,20 @@ impl FileSystem for QueueFileSystem {
             .operation
             .ok_or_else(|| Error::InvalidOperation("no operation specified".to_string()))?;
 
-        let mut backend = self.backend.lock().await;
-
         match operation.as_str() {
             "enqueue" => {
                 let msg = Message::new(data.to_vec());
                 let len = data.len() as u64;
-                backend.enqueue(&queue_name, msg)?;
+                self.storage.enqueue(&queue_name, msg).await?;
                 Ok(len)
             }
             "clear" => {
-                backend.clear(&queue_name)?;
+                self.storage.clear(&queue_name).await?;
                 Ok(0)
             }
             "ack" => {
                 let msg_id = String::from_utf8_lossy(data).trim().to_string();
-                backend.ack(&queue_name, &msg_id)?;
+                self.storage.ack(&queue_name, &msg_id).await?;
                 Ok(0)
             }
             _ => Err(Error::InvalidOperation(format!(
@@ -489,12 +602,11 @@ impl FileSystem for QueueFileSystem {
             return Err(Error::NotADirectory(path.to_string()));
         }
 
-        let backend = self.backend.lock().await;
         let now = SystemTime::now();
 
         // Root directory: list all top-level queues
         if parsed.queue_name.is_none() {
-            let queues = backend.list_queues("");
+            let queues = self.storage.list_queues("").await;
             let mut top_level = std::collections::HashSet::new();
 
             for q in queues {
@@ -517,7 +629,7 @@ impl FileSystem for QueueFileSystem {
 
         // Queue directory: check if it has nested queues
         let queue_name = parsed.queue_name.unwrap();
-        let all_queues = backend.list_queues(&queue_name);
+        let all_queues = self.storage.list_queues(&queue_name).await;
 
         let has_nested = all_queues
             .iter()
@@ -549,7 +661,7 @@ impl FileSystem for QueueFileSystem {
         }
 
         // Leaf queue: return control files
-        if !backend.queue_exists(&queue_name) {
+        if !self.storage.queue_exists(&queue_name).await {
             return Err(Error::NotFound(format!("queue not found: {}", queue_name)));
         }
 
@@ -570,12 +682,10 @@ impl FileSystem for QueueFileSystem {
             });
         }
 
-        let backend = self.backend.lock().await;
-
         if parsed.is_dir {
             // Queue directory
             let queue_name = parsed.queue_name.unwrap();
-            if backend.queue_exists(&queue_name) {
+            if self.storage.queue_exists(&queue_name).await {
                 Ok(FileInfo {
                     name: queue_name
                         .split('/')
@@ -631,7 +741,7 @@ impl FileSystem for QueueFileSystem {
         }
 
         if let Some(queue_name) = parsed.queue_name {
-            self.backend.lock().await.remove_queue(&queue_name)?;
+            self.storage.remove_queue(&queue_name).await?;
             Ok(())
         } else {
             Err(Error::InvalidOperation(
@@ -650,6 +760,8 @@ impl FileSystem for QueueFileSystem {
 /// QueueFS Plugin
 pub struct QueueFSPlugin {
     config_params: Vec<ConfigParameter>,
+    #[cfg(feature = "cache")]
+    cache_runtime: Option<Arc<crate::cache_runtime::CacheRuntime>>,
 }
 
 impl QueueFSPlugin {
@@ -687,8 +799,26 @@ impl QueueFSPlugin {
                     "{}",
                     "Redis connection settings when backend=redis",
                 ),
+                #[cfg(feature = "cache")]
+                ConfigParameter::optional(
+                    "cache_key_prefix",
+                    "string",
+                    "default",
+                    "Queue key namespace when backend=cache",
+                ),
             ],
+            #[cfg(feature = "cache")]
+            cache_runtime: None,
         }
+    }
+
+    #[cfg(feature = "cache")]
+    pub(crate) fn with_cache_runtime(
+        runtime: Arc<crate::cache_runtime::CacheRuntime>,
+    ) -> Self {
+        let mut plugin = Self::new();
+        plugin.cache_runtime = Some(runtime);
+        plugin
     }
 
     fn get_string_param<'a>(config: &'a PluginConfig, key: &str) -> Option<&'a str> {
@@ -701,6 +831,9 @@ impl QueueFSPlugin {
 
     fn parse_backend_config(config: &PluginConfig) -> Result<ParsedBackendConfig> {
         let backend_name = Self::get_string_param(config, "backend").unwrap_or("memory");
+        #[cfg(feature = "cache")]
+        let valid_backends = ["memory", "sqlite", "sqlite3", "redis", "cache"];
+        #[cfg(not(feature = "cache"))]
         let valid_backends = ["memory", "sqlite", "sqlite3", "redis"];
         if !valid_backends.contains(&backend_name) {
             return Err(Error::config(format!(
@@ -714,6 +847,8 @@ impl QueueFSPlugin {
             "memory" => BackendKind::Memory,
             "sqlite" | "sqlite3" => BackendKind::Sqlite,
             "redis" => BackendKind::Redis,
+            #[cfg(feature = "cache")]
+            "cache" => BackendKind::Cache,
             _ => {
                 return Err(Error::config(format!(
                     "unsupported queue backend: {}",
@@ -741,6 +876,8 @@ impl QueueFSPlugin {
 
         let sqlite_db_path = match kind {
             BackendKind::Memory | BackendKind::Redis => None,
+            #[cfg(feature = "cache")]
+            BackendKind::Cache => None,
             BackendKind::Sqlite => {
                 let db_path = Self::get_string_param(config, "db_path").unwrap_or("");
                 if db_path.trim().is_empty() {
@@ -771,6 +908,25 @@ impl QueueFSPlugin {
                 Some(options)
             }
             BackendKind::Memory | BackendKind::Sqlite => None,
+            #[cfg(feature = "cache")]
+            BackendKind::Cache => None,
+        };
+
+        #[cfg(feature = "cache")]
+        let cache_key_prefix = match kind {
+            BackendKind::Cache => {
+                let prefix = Self::get_string_param(config, "cache_key_prefix")
+                    .unwrap_or("default")
+                    .to_string();
+                if prefix.trim().is_empty() || prefix.contains(['{', '}']) {
+                    return Err(Error::config(
+                        "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
+                            .to_string(),
+                    ));
+                }
+                Some(prefix)
+            }
+            _ => None,
         };
 
         Ok(ParsedBackendConfig {
@@ -781,6 +937,8 @@ impl QueueFSPlugin {
                 busy_timeout_ms,
             },
             redis_options,
+            #[cfg(feature = "cache")]
+            cache_key_prefix,
         })
     }
 }
@@ -836,7 +994,15 @@ impl ServicePlugin for QueueFSPlugin {
     }
 
     async fn validate(&self, config: &PluginConfig) -> Result<()> {
-        Self::parse_backend_config(config)?;
+        let parsed = Self::parse_backend_config(config)?;
+        #[cfg(feature = "cache")]
+        if matches!(parsed.kind, BackendKind::Cache) && self.cache_runtime.is_none() {
+            return Err(Error::config(
+                "queuefs backend=cache requires a configured CacheRuntime provider".to_string(),
+            ));
+        }
+        #[cfg(not(feature = "cache"))]
+        let _ = parsed;
         Ok(())
     }
 
@@ -858,6 +1024,21 @@ impl ServicePlugin for QueueFSPlugin {
                         .redis_options
                         .expect("redis options are validated for redis backend"),
                 )?)
+            }
+            #[cfg(feature = "cache")]
+            BackendKind::Cache => {
+                return Ok(Box::new(
+                    QueueFileSystem::with_cache_runtime(
+                        self.cache_runtime
+                            .as_ref()
+                            .expect("cache runtime is validated")
+                            .clone(),
+                        parsed
+                            .cache_key_prefix
+                            .expect("cache key prefix is validated"),
+                    )
+                    .await?,
+                ));
             }
         };
 
@@ -1117,7 +1298,14 @@ mod tests {
 
         assert_eq!(plugin.name(), "queuefs");
         assert!(!plugin.readme().is_empty());
-        assert_eq!(plugin.config_params().len(), 5);
+        let config_params = plugin.config_params();
+        assert_eq!(config_params.len(), 5 + usize::from(cfg!(feature = "cache")));
+        #[cfg(feature = "cache")]
+        assert!(
+            config_params
+                .iter()
+                .any(|parameter| parameter.name == "cache_key_prefix")
+        );
 
         let config =
             PluginConfig::single_backend("queuefs", "/queue", std::collections::HashMap::new());
@@ -1383,6 +1571,80 @@ mod tests {
         // Verify deleted
         let result = fs.stat("/temp").await;
         assert!(result.is_err());
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn cache_runtime_redis_storage_preserves_queuefs_file_flow() {
+        let Ok(endpoint) = std::env::var("QUEUEFS_REDIS_TEST_URL") else {
+            return;
+        };
+        let runtime = crate::cache_runtime::CacheRuntime::redis(
+            crate::cache_runtime::RedisProviderConfig {
+                endpoints: vec![endpoint],
+                key_prefix: String::new(),
+                command_timeout_ms: 1_000,
+                ..crate::cache_runtime::RedisProviderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let queue_prefix = format!("queuefs-runtime-test-{}", uuid::Uuid::new_v4());
+        let fs = QueueFileSystem::with_cache_runtime(runtime.clone(), queue_prefix)
+            .await
+            .unwrap();
+
+        fs.mkdir("/Semantic", 0o755).await.unwrap();
+        fs.write("/Semantic/enqueue", b"payload", 0, WriteFlag::None)
+            .await
+            .unwrap();
+        assert_eq!(fs.read("/Semantic/size", 0, 0).await.unwrap(), b"1");
+        let dequeued: TestQueueMessage =
+            serde_json::from_slice(&fs.read("/Semantic/dequeue", 0, 0).await.unwrap()).unwrap();
+        assert_eq!(dequeued.data, "payload");
+        fs.write(
+            "/Semantic/ack",
+            dequeued.id.as_bytes(),
+            0,
+            WriteFlag::None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fs.read("/Semantic/size", 0, 0).await.unwrap(), b"0");
+        fs.remove_all("/Semantic").await.unwrap();
+        drop(fs);
+        runtime.close().await.unwrap();
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn cache_runtime_failure_is_returned_without_sqlite_fallback() {
+        let Ok(endpoint) = std::env::var("QUEUEFS_REDIS_TEST_URL") else {
+            return;
+        };
+        let runtime = crate::cache_runtime::CacheRuntime::redis(
+            crate::cache_runtime::RedisProviderConfig {
+                endpoints: vec![endpoint],
+                key_prefix: String::new(),
+                command_timeout_ms: 1_000,
+                ..crate::cache_runtime::RedisProviderConfig::default()
+            },
+        )
+        .await
+        .unwrap();
+        let fs = QueueFileSystem::with_cache_runtime(
+            runtime.clone(),
+            format!("queuefs-runtime-failure-{}", uuid::Uuid::new_v4()),
+        )
+        .await
+        .unwrap();
+
+        runtime.close().await.unwrap();
+
+        assert!(matches!(
+            fs.mkdir("/must-not-fallback", 0o755).await,
+            Err(Error::Network(_))
+        ));
     }
 
     #[tokio::test]

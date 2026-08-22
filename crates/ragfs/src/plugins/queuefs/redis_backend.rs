@@ -15,14 +15,14 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-const HEARTBEAT_TTL_SECS: u64 = 30;
-const HEARTBEAT_INTERVAL_SECS: u64 = 10;
-const STARTUP_RECOVERY_SWEEPS: usize = 3;
+pub(super) const HEARTBEAT_TTL_SECS: u64 = 30;
+pub(super) const HEARTBEAT_INTERVAL_SECS: u64 = 10;
+pub(super) const STARTUP_RECOVERY_SWEEPS: usize = 3;
 const REDIS_POOL_MAX_SIZE: u32 = 2;
 const REDIS_POOL_CHECKOUT_TIMEOUT: Duration = Duration::from_secs(5);
 const SENTINEL_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
-const CREATE_QUEUE_SCRIPT: &str = r#"
+pub(super) const CREATE_QUEUE_SCRIPT: &str = r#"
 if redis.call('SADD', KEYS[1], ARGV[1]) == 0 then
     return 0
 end
@@ -30,7 +30,7 @@ redis.call('HSET', KEYS[2], 'created_at', ARGV[2], 'last_updated', ARGV[2])
 return 1
 "#;
 
-const REMOVE_QUEUE_SCRIPT: &str = r#"
+pub(super) const REMOVE_QUEUE_SCRIPT: &str = r#"
 local removed = 0
 local queues = redis.call('SMEMBERS', KEYS[1])
 for _, queue in ipairs(queues) do
@@ -58,7 +58,7 @@ end
 return removed
 "#;
 
-const ENQUEUE_SCRIPT: &str = r#"
+pub(super) const ENQUEUE_SCRIPT: &str = r#"
 if redis.call('SISMEMBER', KEYS[1], ARGV[1]) == 0 then
     return 0
 end
@@ -68,7 +68,7 @@ redis.call('HSET', KEYS[4], 'last_updated', ARGV[4])
 return 1
 "#;
 
-const DEQUEUE_SCRIPT: &str = r#"
+pub(super) const DEQUEUE_SCRIPT: &str = r#"
 local id = redis.call('LPOP', KEYS[1])
 if not id then
     return nil
@@ -82,7 +82,7 @@ redis.call('ZADD', KEYS[2], ARGV[3], id .. '|' .. ARGV[2])
 return {id, payload}
 "#;
 
-const PEEK_SCRIPT: &str = r#"
+pub(super) const PEEK_SCRIPT: &str = r#"
 local id = redis.call('LINDEX', KEYS[1], 0)
 if not id then
     return nil
@@ -94,7 +94,7 @@ end
 return payload
 "#;
 
-const LIST_UNACKED_SCRIPT: &str = r#"
+pub(super) const LIST_UNACKED_SCRIPT: &str = r#"
 local result = {}
 local pending = redis.call('LRANGE', KEYS[1], 0, -1)
 for _, id in ipairs(pending) do
@@ -119,7 +119,7 @@ end
 return result
 "#;
 
-const ACK_SCRIPT: &str = r#"
+pub(super) const ACK_SCRIPT: &str = r#"
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(members) do
     if string.sub(member, 1, string.len(ARGV[1]) + 1) == ARGV[1] .. '|' then
@@ -131,7 +131,7 @@ end
 return 0
 "#;
 
-const CLEAR_SCRIPT: &str = r#"
+pub(super) const CLEAR_SCRIPT: &str = r#"
 local pending = redis.call('LRANGE', KEYS[1], 0, -1)
 for _, id in ipairs(pending) do
     redis.call('DEL', ARGV[1] .. id)
@@ -147,7 +147,7 @@ redis.call('DEL', KEYS[1], KEYS[2])
 return #pending + #processing
 "#;
 
-const RECOVER_STALE_SCRIPT: &str = r#"
+pub(super) const RECOVER_STALE_SCRIPT: &str = r#"
 local recovered = 0
 local members = redis.call('ZRANGE', KEYS[1], 0, -1)
 for _, member in ipairs(members) do
@@ -165,16 +165,16 @@ end
 return recovered
 "#;
 
-struct QueueKeys {
-    meta: String,
-    pending: String,
-    processing: String,
-    message_prefix: String,
+pub(super) struct QueueKeys {
+    pub(super) meta: String,
+    pub(super) pending: String,
+    pub(super) processing: String,
+    pub(super) message_prefix: String,
 }
 
 impl QueueKeys {
     /// Build all Redis keys owned by one queue.
-    fn new(key_prefix: &str, queue: &str) -> Self {
+    pub(super) fn new(key_prefix: &str, queue: &str) -> Self {
         let prefix = format!("{}{queue}", queue_key_prefix(key_prefix));
         Self {
             meta: format!("{prefix}:meta"),
@@ -185,7 +185,7 @@ impl QueueKeys {
     }
 
     /// Build the payload key for one message.
-    fn message(&self, message_id: &str) -> String {
+    pub(super) fn message(&self, message_id: &str) -> String {
         format!("{}{message_id}", self.message_prefix)
     }
 }
@@ -937,32 +937,32 @@ impl QueueBackend for RedisQueueBackend {
 }
 
 /// Return the queue registry key for one namespace.
-fn queue_names_key(key_prefix: &str) -> String {
+pub(super) fn queue_names_key(key_prefix: &str) -> String {
     format!("{}names", queue_key_prefix(key_prefix))
 }
 
 /// Return the queue key prefix for one namespace.
-fn queue_key_prefix(key_prefix: &str) -> String {
+pub(super) fn queue_key_prefix(key_prefix: &str) -> String {
     format!("{{{key_prefix}}}:ov:queue:")
 }
 
 /// Return the instance key prefix for one namespace.
-fn instance_key_prefix(key_prefix: &str) -> String {
+pub(super) fn instance_key_prefix(key_prefix: &str) -> String {
     format!("{}instance:", queue_key_prefix(key_prefix))
 }
 
 /// Return the heartbeat key for one instance.
-fn heartbeat_key(key_prefix: &str, instance_id: &str) -> String {
+pub(super) fn heartbeat_key(key_prefix: &str, instance_id: &str) -> String {
     format!("{}{instance_id}:alive", instance_key_prefix(key_prefix))
 }
 
 /// Return Unix seconds for Redis scores and metadata.
-fn unix_secs(time: SystemTime) -> u64 {
+pub(super) fn unix_secs(time: SystemTime) -> u64 {
     time.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs()
 }
 
 /// Return the latest timestamp among the current pending payloads.
-fn last_enqueue_time_from_pending_payloads(payloads: &[String]) -> Result<SystemTime> {
+pub(super) fn last_enqueue_time_from_pending_payloads(payloads: &[String]) -> Result<SystemTime> {
     payloads.iter().try_fold(UNIX_EPOCH, |latest, payload| {
         let timestamp = serde_json::from_str::<StoredMessage>(payload)
             .map(StoredMessage::into_message)
