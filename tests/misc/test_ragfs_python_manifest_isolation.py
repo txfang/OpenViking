@@ -26,7 +26,6 @@ def test_workspace_uses_ragfs_runtime_and_one_python_binding_crate():
     manifest = _read(ROOT / "Cargo.toml")
     workspace = _section(manifest, "workspace")
     members = _array_items(workspace, "members")
-    excludes = _array_items(workspace, "exclude")
 
     assert "crates/ragfs" in members
     assert "crates/ragfs-python" in members
@@ -35,10 +34,6 @@ def test_workspace_uses_ragfs_runtime_and_one_python_binding_crate():
     assert "crates/ragfs-cache-mooncake" not in members
     assert "crates/ragfs-cache-yuanrong" not in members
     assert "crates/ragfs-cache-yuanrong-sys" not in members
-
-    assert "crates/ragfs-cache-mooncake" in excludes
-    assert "crates/ragfs-cache-yuanrong" in excludes
-    assert "crates/ragfs-cache-yuanrong-sys" in excludes
 
 
 def test_ragfs_python_uses_the_runtime_embedded_in_ragfs():
@@ -58,6 +53,9 @@ def test_ragfs_python_uses_the_runtime_embedded_in_ragfs():
 
 def test_legacy_provider_and_binding_manifests_are_removed():
     assert not (ROOT / "crates/ragfs-cache-redis/Cargo.toml").exists()
+    assert not (ROOT / "crates/ragfs-cache-mooncake/Cargo.toml").exists()
+    assert not (ROOT / "crates/ragfs-cache-yuanrong/Cargo.toml").exists()
+    assert not (ROOT / "crates/ragfs-cache-yuanrong-sys/Cargo.toml").exists()
     assert not (ROOT / "crates/ragfs-python-native/Cargo.toml").exists()
 
 
@@ -67,4 +65,7 @@ def test_source_distribution_contains_only_active_ragfs_crates():
     assert "graft crates/ragfs\n" in manifest
     assert "graft crates/ragfs-python\n" in manifest
     assert "graft crates/ragfs-cache-redis" not in manifest
+    assert "graft crates/ragfs-cache-mooncake" not in manifest
+    assert "graft crates/ragfs-cache-yuanrong" not in manifest
+    assert "graft crates/ragfs-cache-yuanrong-sys" not in manifest
     assert "graft crates/ragfs-python-native" not in manifest

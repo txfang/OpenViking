@@ -38,7 +38,7 @@ Then enable the cache under `storage.agfs.cache` in `~/.openviking/ov.conf`. The
           "pool_size": 32,
           "connect_timeout_ms": 1000,
           "command_timeout_ms": 20,
-          "key_prefix": "ragfs-cache",
+          "key_prefix": "",
           "default_ttl_seconds": 3600,
           "read_from_replica": false
         }
@@ -65,110 +65,24 @@ Available Providers:
 
 | Provider | Best for | Notes |
 |----------|----------|-------|
-| `memory` | Local validation and tests | In-process cache; lost after restart |
-| `redis` | Fast rollout on standard networks | Currently supports standalone; read from primary only |
-| `yuanrong` | Near-compute cache, shared memory, or heterogeneous multi-tier cache | Requires Yuanrong worker and native feature |
-| `mooncake` | Remote memory pool, RDMA/TCP data plane | Requires Mooncake services and native feature |
+| `redis` | Default delivery on standard networks | Built into RAGFS; currently supports standalone and reads from primary only |
+| `dynamic` | YuanRong, Mooncake, or closed-source cache systems | Loads an external Provider `.so` through a versioned C ABI |
 
-If the runtime package was not compiled with the selected Provider, startup returns an error similar to "requires the ... feature".
+`MemoryMockProvider` is only used by unit and smoke tests; it is not a production configuration option.
 
-## Native Provider Builds
+## Dynamic Provider Delivery
 
-The standard OpenViking wheel is suitable for the `memory` and `redis`
-Providers. The `yuanrong` and `mooncake` Providers depend on platform-specific
-native SDKs and must be built for the target deployment environment.
+The standard OpenViking wheel contains only the built-in Redis Provider and the DynamicProvider loader. Source code and SDKs for external Providers such as YuanRong and Mooncake are not distributed in the OpenViking repository. The Provider publisher builds and releases the `.so` independently.
 
-Install the wheel builder first:
+A dynamic library must export this versioned entry point:
 
-```bash
-python -m pip install "maturin[patchelf]"
+```text
+openviking_cache_provider_v1
 ```
 
-### Yuanrong
+Provider artifacts should declare the ABI version, target OS and CPU, minimum glibc version, external SDK version, dynamic dependencies, and SHA256. When a Provider depends on native libraries, its publisher must make them discoverable through RPATH, `LD_LIBRARY_PATH`, or deployment instructions.
 
-Install the Yuanrong DataSystem C++ SDK and export its header and library
-locations:
-
-```bash
-export YUANRONG_SDK_INCLUDE=/path/to/yuanrong/include
-export YUANRONG_SDK_LIB_DIR=/path/to/yuanrong/lib
-# Optional; defaults to "datasystem".
-export YUANRONG_SDK_LIB_NAME=datasystem
-export LD_LIBRARY_PATH="$YUANRONG_SDK_LIB_DIR:${LD_LIBRARY_PATH:-}"
-```
-
-Build and install the wheel:
-
-```bash
-maturin build --release \
-  --manifest-path crates/ragfs-python-native/Cargo.toml \
-  --features yuanrong-native
-
-python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
-```
-
-The Yuanrong worker configured by `storage.agfs.cache.yuanrong` must be
-available when OpenViking starts.
-
-### Mooncake
-
-Check out the Mooncake revision used by
-`crates/ragfs-cache-mooncake/Cargo.toml`, then build Mooncake Store with Rust
-support:
-
-```bash
-cmake -S /path/to/Mooncake -B /path/to/Mooncake/build \
-  -DWITH_STORE=ON \
-  -DWITH_STORE_RUST=ON \
-  -DCMAKE_BUILD_TYPE=Release
-
-cmake --build /path/to/Mooncake/build \
-  --target build_mooncake_store_rust mooncake_master -j
-```
-
-Export the paths required by the official Mooncake Rust binding:
-
-```bash
-export MOONCAKE_BUILD_DIR=/path/to/Mooncake/build
-export MOONCAKE_STORE_LIB_DIR="$MOONCAKE_BUILD_DIR/mooncake-store/src"
-export MOONCAKE_STORE_INCLUDE_DIR=/path/to/Mooncake/mooncake-store/include
-export LD_LIBRARY_PATH="$MOONCAKE_BUILD_DIR/mooncake-common:\
-$MOONCAKE_BUILD_DIR/mooncake-common/src:\
-$MOONCAKE_BUILD_DIR/mooncake-store/src:\
-$MOONCAKE_BUILD_DIR/mooncake-store/src/cachelib_memory_allocator:\
-$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src:\
-$MOONCAKE_BUILD_DIR/mooncake-transfer-engine/src/common/base:\
-${LD_LIBRARY_PATH:-}"
-```
-
-Build and install the wheel:
-
-```bash
-maturin build --release \
-  --manifest-path crates/ragfs-python-native/Cargo.toml \
-  --features mooncake-native
-
-python -m pip install --force-reinstall target/wheels/ragfs_python-*.whl
-```
-
-The Mooncake metadata service and Master configured by
-`storage.agfs.cache.mooncake` must be available when OpenViking starts.
-Native wheels are platform-specific and should be built on a system compatible
-with the target deployment environment.
-
-For production wheels, use a Mooncake revision whose Rust `build.rs` links
-`libasan` only when ASan is explicitly enabled. Verify that the release wheel
-does not contain or depend on `libasan`:
-
-```bash
-rm -rf /tmp/ragfs-python-wheel
-python -m zipfile -e target/wheels/ragfs_python-*.whl /tmp/ragfs-python-wheel
-readelf -d /tmp/ragfs-python-wheel/ragfs_python/ragfs_python.abi3.so \
-  | grep libasan
-find /tmp/ragfs-python-wheel -name 'libasan*'
-```
-
-Both checks should produce no output.
+External Providers can be upgraded independently without rebuilding the default OpenViking wheel. OpenViking only needs a coordinated upgrade when the DynamicProvider ABI becomes incompatible.
 
 ## Configuration
 
@@ -177,9 +91,10 @@ Both checks should produce no output.
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `enabled` | bool | `false` | Enable the RAGFS cache |
-| `provider` | str | `"memory"` | `memory`, `redis`, `yuanrong`, or `mooncake` |
+| `provider` | str | `"redis"` | `redis` or `dynamic` |
 | `namespace` | str | `"openviking"` | Cache namespace for isolating deployments or tenants |
 | `max_file_size_bytes` | int | `1048576` | Maximum full-file object size admitted to cache |
+| `traversal_mode` | str | `"backend"` | Use backend traversal or `cached_traversal` for recursive APIs |
 | `bypass_prefixes` | list[str] | `[]` | Path prefixes that always bypass cache |
 
 Redis configuration:
@@ -193,11 +108,13 @@ Redis configuration:
 | `pool_size` | `32` | Command concurrency |
 | `connect_timeout_ms` | `1000` | Connection timeout |
 | `command_timeout_ms` | `20` | Command timeout |
-| `key_prefix` | `"ragfs-cache"` | Redis-side key prefix |
+| `key_prefix` | `""` | Reserved compatibility field; the unified Runtime requires an empty value |
 | `default_ttl_seconds` | `3600` | Default TTL; `0` means no TTL |
 | `read_from_replica` | `false` | Must be `false` in standalone mode |
 
-Yuanrong configuration:
+DynamicProvider configuration example:
+
+`dynamic.params` is entirely Provider-owned. The fields below only illustrate configuration forwarding; use the schema documented by the Provider publisher.
 
 ```json
 {
@@ -205,40 +122,13 @@ Yuanrong configuration:
     "agfs": {
       "cache": {
         "enabled": true,
-        "provider": "yuanrong",
-        "yuanrong": {
-          "host": "127.0.0.1",
-          "port": 31501,
-          "connect_timeout_ms": 5000,
-          "request_timeout_ms": 5000,
-          "sdk_concurrency": 4
-        }
-      }
-    }
-  }
-}
-```
-
-Mooncake configuration:
-
-```json
-{
-  "storage": {
-    "agfs": {
-      "cache": {
-        "enabled": true,
-        "provider": "mooncake",
-        "mooncake": {
-          "local_hostname": "127.0.0.1",
-          "metadata_server": "http://127.0.0.1:8080/metadata",
-          "master_server_addr": "127.0.0.1:50051",
-          "protocol": "tcp",
-          "device_name": "",
-          "global_segment_size": 536870912,
-          "local_buffer_size": 134217728,
-          "replica_num": 2,
-          "sdk_concurrency": 4,
-          "operation_timeout_ms": 5000
+        "provider": "dynamic",
+        "dynamic": {
+          "library": "/opt/openviking/providers/libopenviking_cache_provider.so",
+          "params": {
+            "endpoint": "127.0.0.1:31501",
+            "request_timeout_ms": 5000
+          }
         }
       }
     }
@@ -251,7 +141,7 @@ Mooncake configuration:
 RAGFS splits caching into two layers:
 
 - `CachedFileSystem`: implements filesystem semantics, including cache hit/miss handling, backend fallback, cache fill, invalidation, generation checks, and metrics.
-- `CacheProvider`: only stores cache objects through `get`, `put`, `delete`, batch reads/writes, and close operations.
+- `CacheRuntime`: exposes common primitive operations and binds either the built-in RedisProvider or an external DynamicProvider at startup.
 
 Call flow:
 
@@ -259,11 +149,12 @@ Call flow:
 OpenViking
   -> RAGFS / MountableFS
   -> CachedFileSystem
-       |-> CacheProvider -> Memory / Redis / Yuanrong / Mooncake
+       |-> CacheRuntime -> RedisProvider
+       |               `-> DynamicProvider -> external provider .so
        `-> Backend FileSystem
 ```
 
-With this boundary, file, directory, rename, recursive delete, and write-after-invalidation logic live only in the common layer. A Provider does not need to understand path semantics; it only needs to store stable key-value objects.
+With this boundary, file, directory, rename, recursive delete, and write-after-invalidation logic live only in the common layer. An external Provider does not need to understand path semantics; it only supplies primitive key-value operations through the stable C ABI.
 
 ## Cache Objects
 
@@ -366,9 +257,9 @@ Recommended signals to watch:
 
 ## Recommended Rollout
 
-1. Use `memory` locally to validate the configuration shape.
-2. Use `redis` to validate real remote-cache benefits.
-3. Move to `yuanrong` or `mooncake` for high-performance environments.
+1. Disable caching to validate baseline backend behavior.
+2. Use the built-in `redis` Provider to validate remote-cache benefits.
+3. Use an independently released DynamicProvider `.so` for high-performance or closed-source cache systems.
 4. Cache summary files and raw `read_dir` first, then expand to more regular small files.
 5. Add lock, control-plane, and permission-sensitive paths to `bypass_prefixes`.
 

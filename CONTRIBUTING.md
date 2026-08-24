@@ -131,12 +131,7 @@ openviking/
 ├── crates/               # Rust components
 │   ├── ov_cli/           # Rust CLI client
 │   ├── ragfs/            # Rust implementation of AGFS
-│   ├── ragfs-python/     # Python binding for RAGFS
-│   ├── ragfs-python-native/       # Native Python binding package
-│   ├── ragfs-cache-redis/         # Redis cache backend
-│   ├── ragfs-cache-mooncake/      # Mooncake cache backend
-│   ├── ragfs-cache-yuanrong/      # YuanRong cache backend
-│   └── ragfs-cache-yuanrong-sys/  # YuanRong FFI bindings
+│   └── ragfs-python/     # Python binding for RAGFS
 ├── src/                  # C++ extension sources (Python abi3)
 ├── third_party/          # Native third-party dependencies
 ├── examples/             # Usage and integration examples

@@ -4,11 +4,6 @@ members = [
     "crates/ragfs",
     "crates/ragfs-python",
 ]
-exclude = [
-    "crates/ragfs-cache-mooncake",
-    "crates/ragfs-cache-yuanrong",
-    "crates/ragfs-cache-yuanrong-sys",
-]
 resolver = "2"
 
 [profile.release]
