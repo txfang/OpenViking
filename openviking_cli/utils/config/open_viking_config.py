@@ -11,6 +11,7 @@ from pydantic import BaseModel, Field, ValidationError, model_validator
 
 from openviking_cli.session.user_id import UserIdentifier
 
+from .cache_config import CacheConfig
 from .config_loader import resolve_config_path
 from .config_utils import format_validation_error, raise_unknown_config_fields
 from .consts import (
@@ -145,6 +146,11 @@ class OpenVikingConfig(BaseModel):
     default_agent: Optional[str] = Field(
         default=None,
         description="Deprecated and ignored. User is the only data-plane identity.",
+    )
+
+    cache: Optional[CacheConfig] = Field(
+        default=None,
+        description="Global cache Provider configuration",
     )
 
     storage: StorageConfig = Field(
@@ -309,6 +315,15 @@ class OpenVikingConfig(BaseModel):
             )
         return self
 
+    @model_validator(mode="after")
+    def _validate_cache_runtime_config(self) -> "OpenVikingConfig":
+        agfs = self.storage.agfs
+        uses_canonical_cache = agfs.cachefs.backend == "cache" or agfs.queuefs.backend == "cache"
+        has_legacy_cache = bool(agfs.cache.model_fields_set)
+        if uses_canonical_cache and self.cache is None and not has_legacy_cache:
+            raise ValueError("top-level cache config is required when an AGFS backend uses cache")
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _inherit_git_defaults_from_agfs(cls, data: Any) -> Any:
@@ -360,6 +375,93 @@ class OpenVikingConfig(BaseModel):
         data = dict(data)
         data["git"] = git
         return data
+
+    @model_validator(mode="before")
+    @classmethod
+    def _normalize_legacy_cache_config(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        normalized = dict(data)
+        storage_value = normalized.get("storage")
+        if not isinstance(storage_value, dict):
+            return normalized
+        storage = dict(storage_value)
+        agfs_value = storage.get("agfs")
+        if not isinstance(agfs_value, dict):
+            return normalized
+        agfs = dict(agfs_value)
+
+        cache_value = normalized.get("cache")
+        canonical_cache = dict(cache_value) if isinstance(cache_value, dict) else None
+
+        def merge_provider(provider: str, params: Dict[str, Any], source: str) -> None:
+            nonlocal canonical_cache
+            if canonical_cache is None:
+                canonical_cache = {"provider": provider, "params": dict(params)}
+                return
+            if canonical_cache.get("provider") != provider:
+                raise ValueError(f"{source} conflicts with top-level cache provider")
+            existing_params = canonical_cache.get("params", {})
+            if not isinstance(existing_params, dict):
+                raise ValueError("top-level cache params must be an object")
+            merged_params = dict(existing_params)
+            for key, value in params.items():
+                if key in merged_params and merged_params[key] != value:
+                    raise ValueError(f"{source} conflicts with top-level cache params: {key}")
+                merged_params.setdefault(key, value)
+            canonical_cache["params"] = merged_params
+
+        legacy_cache = agfs.pop("cache", None)
+        if isinstance(legacy_cache, dict):
+            cachefs_value = agfs.get("cachefs")
+            cachefs = dict(cachefs_value) if isinstance(cachefs_value, dict) else {}
+            cachefs.setdefault(
+                "backend", "cache" if legacy_cache.get("enabled", False) else "local"
+            )
+            for field in (
+                "namespace",
+                "max_file_size_bytes",
+                "traversal_mode",
+                "bypass_prefixes",
+            ):
+                if field in legacy_cache:
+                    cachefs.setdefault(field, legacy_cache[field])
+            agfs["cachefs"] = cachefs
+
+            provider = str(legacy_cache.get("provider", "redis"))
+            provider_params = legacy_cache.get(provider, {})
+            provider_was_configured = (
+                bool(legacy_cache.get("enabled", False))
+                or "provider" in legacy_cache
+                or provider in legacy_cache
+            )
+            if provider_was_configured:
+                if not isinstance(provider_params, dict):
+                    raise ValueError(f"storage.agfs.cache.{provider} must be an object")
+                merge_provider(provider, provider_params, "storage.agfs.cache")
+
+        queuefs_value = agfs.get("queuefs")
+        if isinstance(queuefs_value, dict) and queuefs_value.get("backend") == "redis":
+            queuefs = dict(queuefs_value)
+            redis_value = queuefs.pop("redis", {})
+            if not isinstance(redis_value, dict):
+                raise ValueError("storage.agfs.queuefs.redis must be an object")
+            redis_params = dict(redis_value)
+            key_prefix = redis_params.pop("key_prefix", None)
+            if redis_params.get("mode") == "singleton":
+                redis_params["mode"] = "standalone"
+            merge_provider("redis", redis_params, "storage.agfs.queuefs.redis")
+            queuefs["backend"] = "cache"
+            if key_prefix is not None:
+                queuefs.setdefault("cache_key_prefix", key_prefix)
+            agfs["queuefs"] = queuefs
+
+        if canonical_cache is not None:
+            normalized["cache"] = canonical_cache
+        storage["agfs"] = agfs
+        normalized["storage"] = storage
+        return normalized
 
     allow_private_networks: bool = Field(
         default=False,

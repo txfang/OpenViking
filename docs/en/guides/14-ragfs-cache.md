@@ -18,30 +18,31 @@ openviking-server init
 openviking-server doctor
 ```
 
-Then enable the cache under `storage.agfs.cache` in `~/.openviking/ov.conf`. The following Redis example is a good quick validation setup:
+Configure the global top-level `cache` Provider, then select `backend=cache` under `storage.agfs.cachefs`:
 
 ```json
 {
+  "cache": {
+    "provider": "redis",
+    "params": {
+      "mode": "standalone",
+      "endpoints": ["redis://127.0.0.1:6379"],
+      "pool_size": 32,
+      "connect_timeout_ms": 1000,
+      "command_timeout_ms": 1000,
+      "default_ttl_seconds": 3600,
+      "read_from_replica": false
+    }
+  },
   "storage": {
     "workspace": "./data",
     "agfs": {
       "backend": "local",
-      "cache": {
-        "enabled": true,
-        "provider": "redis",
+      "cachefs": {
+        "backend": "cache",
         "namespace": "openviking",
         "max_file_size_bytes": 1048576,
-        "bypass_prefixes": ["/queue", "/tmp"],
-        "redis": {
-          "mode": "standalone",
-          "endpoints": ["redis://127.0.0.1:6379"],
-          "pool_size": 32,
-          "connect_timeout_ms": 1000,
-          "command_timeout_ms": 20,
-          "key_prefix": "",
-          "default_ttl_seconds": 3600,
-          "read_from_replica": false
-        }
+        "bypass_prefixes": ["/queue", "/tmp"]
       }
     }
   }
@@ -65,14 +66,14 @@ Available Providers:
 
 | Provider | Best for | Notes |
 |----------|----------|-------|
-| `redis` | Default delivery on standard networks | Built into RAGFS; currently supports standalone and reads from primary only |
-| `dynamic` | YuanRong, Mooncake, or closed-source cache systems | Loads an external Provider `.so` through a versioned C ABI |
+| `redis` | Default delivery on standard networks | Built into RAGFS; supports standalone, Cluster, and Sentinel |
+| `dynamic` | YuanRong, Mooncake, or closed-source cache systems | Not implemented in this release; returns UnsupportedProvider |
 
 `MemoryMockProvider` is only used by unit and smoke tests; it is not a production configuration option.
 
-## Dynamic Provider Delivery
+## Future DynamicProvider
 
-The standard OpenViking wheel contains only the built-in Redis Provider and the DynamicProvider loader. Source code and SDKs for external Providers such as YuanRong and Mooncake are not distributed in the OpenViking repository. The Provider publisher builds and releases the `.so` independently.
+This release only ships the built-in RedisProvider. DynamicProvider, `.so` loading, and the versioned C ABI are deferred; configuring `provider=dynamic` currently returns UnsupportedProvider during startup.
 
 A dynamic library must export this versioned entry point:
 
@@ -86,12 +87,18 @@ External Providers can be upgraded independently without rebuilding the default 
 
 ## Configuration
 
-`storage.agfs.cache` supports these common options:
+The top-level `cache` section is a sibling of `storage`:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `enabled` | bool | `false` | Enable the RAGFS cache |
-| `provider` | str | `"redis"` | `redis` or `dynamic` |
+| `provider` | str | none | Provider name; this release supports `redis` |
+| `params` | object | `{}` | Provider-owned parameters |
+
+`storage.agfs.cachefs` controls CacheFS behavior:
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `backend` | str | `"local"` | `local` preserves existing behavior; `cache` enables CachedFileSystem |
 | `namespace` | str | `"openviking"` | Cache namespace for isolating deployments or tenants |
 | `max_file_size_bytes` | int | `1048576` | Maximum full-file object size admitted to cache |
 | `traversal_mode` | str | `"backend"` | Use backend traversal or `cached_traversal` for recursive APIs |
@@ -110,27 +117,20 @@ Redis configuration:
 | `command_timeout_ms` | `20` | Command timeout |
 | `key_prefix` | `""` | Reserved compatibility field; the unified Runtime requires an empty value |
 | `default_ttl_seconds` | `3600` | Default TTL; `0` means no TTL |
-| `read_from_replica` | `false` | Must be `false` in standalone mode |
+| `read_from_replica` | `false` | Supported only in Cluster mode; enable according to CacheFS consistency requirements |
 
-DynamicProvider configuration example:
+Future DynamicProvider configuration shape:
 
-`dynamic.params` is entirely Provider-owned. The fields below only illustrate configuration forwarding; use the schema documented by the Provider publisher.
+`cache.params` is entirely Provider-owned. The fields below only illustrate configuration forwarding; use the schema documented by the Provider publisher.
 
 ```json
 {
-  "storage": {
-    "agfs": {
-      "cache": {
-        "enabled": true,
-        "provider": "dynamic",
-        "dynamic": {
-          "library": "/opt/openviking/providers/libopenviking_cache_provider.so",
-          "params": {
-            "endpoint": "127.0.0.1:31501",
-            "request_timeout_ms": 5000
-          }
-        }
-      }
+  "cache": {
+    "provider": "dynamic",
+    "params": {
+      "library": "/opt/openviking/providers/libopenviking_cache_provider.so",
+      "endpoint": "127.0.0.1:31501",
+      "request_timeout_ms": 5000
     }
   }
 }
@@ -141,7 +141,7 @@ DynamicProvider configuration example:
 RAGFS splits caching into two layers:
 
 - `CachedFileSystem`: implements filesystem semantics, including cache hit/miss handling, backend fallback, cache fill, invalidation, generation checks, and metrics.
-- `CacheRuntime`: exposes common primitive operations and binds either the built-in RedisProvider or an external DynamicProvider at startup.
+- `CacheRuntime`: exposes common primitive operations and binds the built-in RedisProvider in this release; DynamicProvider remains a future extension.
 
 Call flow:
 
@@ -150,7 +150,7 @@ OpenViking
   -> RAGFS / MountableFS
   -> CachedFileSystem
        |-> CacheRuntime -> RedisProvider
-       |               `-> DynamicProvider -> external provider .so
+       |               `-> DynamicProvider (future)
        `-> Backend FileSystem
 ```
 

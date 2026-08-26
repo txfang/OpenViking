@@ -18,30 +18,31 @@ openviking-server init
 openviking-server doctor
 ```
 
-然后在 `~/.openviking/ov.conf` 的 `storage.agfs.cache` 中启用缓存。下面是 Redis 示例，适合快速验证：
+然后在 `~/.openviking/ov.conf` 中配置顶层 `cache` Provider，并在 `storage.agfs.cachefs` 选择 `backend=cache`：
 
 ```json
 {
+  "cache": {
+    "provider": "redis",
+    "params": {
+      "mode": "standalone",
+      "endpoints": ["redis://127.0.0.1:6379"],
+      "pool_size": 32,
+      "connect_timeout_ms": 1000,
+      "command_timeout_ms": 1000,
+      "default_ttl_seconds": 3600,
+      "read_from_replica": false
+    }
+  },
   "storage": {
     "workspace": "./data",
     "agfs": {
       "backend": "local",
-      "cache": {
-        "enabled": true,
-        "provider": "redis",
+      "cachefs": {
+        "backend": "cache",
         "namespace": "openviking",
         "max_file_size_bytes": 1048576,
-        "bypass_prefixes": ["/queue", "/tmp"],
-        "redis": {
-          "mode": "standalone",
-          "endpoints": ["redis://127.0.0.1:6379"],
-          "pool_size": 32,
-          "connect_timeout_ms": 1000,
-          "command_timeout_ms": 20,
-          "key_prefix": "",
-          "default_ttl_seconds": 3600,
-          "read_from_replica": false
-        }
+        "bypass_prefixes": ["/queue", "/tmp"]
       }
     }
   }
@@ -65,14 +66,14 @@ openviking-server
 
 | Provider | 适用场景 | 备注 |
 |----------|----------|------|
-| `redis` | 默认交付、普通网络环境 | 内置于 RAGFS，当前支持 standalone，只从 primary 读取 |
-| `dynamic` | YuanRong、Mooncake 或闭源缓存系统 | 通过版本化 C ABI 加载外部 Provider `.so` |
+| `redis` | 默认交付、普通网络环境 | 内置于 RAGFS，支持 standalone、Cluster 和 Sentinel |
+| `dynamic` | YuanRong、Mooncake 或闭源缓存系统 | 本期未实现，配置后返回 UnsupportedProvider |
 
 `MemoryMockProvider` 只用于单元测试和 smoke test，不是生产配置项。
 
-## 动态 Provider 发布
+## 后续 DynamicProvider
 
-标准 OpenViking wheel 只内置 Redis Provider 和 DynamicProvider 加载能力。YuanRong、Mooncake 等外部 Provider 的构建源码和 SDK 不随 OpenViking 主仓发布，由 Provider 发布方在独立环境中构建并交付 `.so`。
+本期标准 OpenViking wheel 只内置 RedisProvider。DynamicProvider、`.so` 加载器和版本化 C ABI 放在后续阶段实现；当前配置 `provider=dynamic` 会在启动阶段返回 UnsupportedProvider。
 
 动态库必须导出以下版本化入口：
 
@@ -86,12 +87,18 @@ Provider 发布物应注明 ABI 版本、目标 OS/CPU、最低 glibc 版本、�
 
 ## 配置项
 
-`storage.agfs.cache` 支持以下通用配置：
+顶层 `cache` 与 `storage` 并列：
 
 | 参数 | 类型 | 默认值 | 说明 |
 |------|------|--------|------|
-| `enabled` | bool | `false` | 是否启用 RAGFS 缓存 |
-| `provider` | str | `"redis"` | `redis` 或 `dynamic` |
+| `provider` | str | 无 | Provider 名称，本期支持 `redis` |
+| `params` | object | `{}` | Provider 自有参数 |
+
+`storage.agfs.cachefs` 支持以下业务配置：
+
+| 参数 | 类型 | 默认值 | 说明 |
+|------|------|--------|------|
+| `backend` | str | `"local"` | `local` 沿用原逻辑；`cache` 启用 CachedFileSystem |
 | `namespace` | str | `"openviking"` | 缓存命名空间，用于隔离不同部署或租户 |
 | `max_file_size_bytes` | int | `1048576` | 允许进入缓存的最大完整文件大小 |
 | `traversal_mode` | str | `"backend"` | 递归 API 使用 backend 遍历或 `cached_traversal` |
@@ -110,27 +117,20 @@ Redis 配置：
 | `command_timeout_ms` | `20` | 命令超时 |
 | `key_prefix` | `""` | 保留兼容字段；统一 Runtime 要求为空 |
 | `default_ttl_seconds` | `3600` | 默认 TTL；`0` 表示不设置 TTL |
-| `read_from_replica` | `false` | standalone 模式下必须为 `false` |
+| `read_from_replica` | `false` | 仅 Cluster 模式支持；CacheFS 可按一致性要求选择是否开启 |
 
-DynamicProvider 配置示例：
+未来 DynamicProvider 配置结构：
 
-`dynamic.params` 完全由外部 Provider 定义，下面的字段只用于说明配置传递方式，实际配置以 Provider 发布说明为准。
+`cache.params` 完全由外部 Provider 定义，下面的字段只用于说明配置传递方式，实际配置以 Provider 发布说明为准。
 
 ```json
 {
-  "storage": {
-    "agfs": {
-      "cache": {
-        "enabled": true,
-        "provider": "dynamic",
-        "dynamic": {
-          "library": "/opt/openviking/providers/libopenviking_cache_provider.so",
-          "params": {
-            "endpoint": "127.0.0.1:31501",
-            "request_timeout_ms": 5000
-          }
-        }
-      }
+  "cache": {
+    "provider": "dynamic",
+    "params": {
+      "library": "/opt/openviking/providers/libopenviking_cache_provider.so",
+      "endpoint": "127.0.0.1:31501",
+      "request_timeout_ms": 5000
     }
   }
 }
@@ -141,7 +141,7 @@ DynamicProvider 配置示例：
 RAGFS 将缓存拆成两层：
 
 - `CachedFileSystem`：实现文件系统语义，包括 cache hit/miss、backend 回源、回填、失效、generation 校验和指标。
-- `CacheRuntime`：向业务层提供统一基础操作，并在启动时绑定内置 RedisProvider 或外部 DynamicProvider。
+- `CacheRuntime`：向业务层提供统一基础操作，本期在启动时绑定内置 RedisProvider；DynamicProvider 为后续扩展。
 
 调用关系：
 
@@ -150,7 +150,7 @@ OpenViking
   -> RAGFS / MountableFS
   -> CachedFileSystem
        |-> CacheRuntime -> RedisProvider
-       |               `-> DynamicProvider -> external provider .so
+       |               `-> DynamicProvider（后续）
        `-> Backend FileSystem
 ```
 

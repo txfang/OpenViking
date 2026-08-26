@@ -9,13 +9,15 @@ mod provider;
 mod redis;
 mod script;
 
-pub use api::{AsyncCacheRuntime, PutOptions, SyncCacheRuntime};
+pub use api::{
+    Expiration, ListDirection, ListInsertPosition, ListInsertRequest, ListMoveRequest,
+    SetCondition, SetOptions, SetResult,
+};
 pub use dynamic::DynamicProviderConfig;
 pub use error::{CacheError, CacheResult};
 pub use memory::MemoryMockProvider;
-pub use redis::RedisProviderConfig;
+pub use redis::{RedisDeploymentMode, RedisProviderConfig};
 
-use async_trait::async_trait;
 use bytes::Bytes;
 use executor::RuntimeExecutor;
 use provider::CacheProvider;
@@ -58,12 +60,20 @@ impl CacheRuntime {
         provider: Arc<dyn CacheProvider>,
         scripts: Arc<ScriptRegistry>,
     ) -> Arc<Self> {
+        let executor =
+            Arc::new(RuntimeExecutor::new().expect("CacheRuntime executor must initialize"));
+        Self::from_provider_with_parts(provider, scripts, executor)
+    }
+
+    fn from_provider_with_parts(
+        provider: Arc<dyn CacheProvider>,
+        scripts: Arc<ScriptRegistry>,
+        executor: Arc<RuntimeExecutor>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             provider,
             scripts,
-            executor: Arc::new(
-                RuntimeExecutor::new().expect("CacheRuntime executor must initialize"),
-            ),
+            executor,
             closed: AtomicBool::new(false),
         })
     }
@@ -88,14 +98,192 @@ impl CacheRuntime {
         ))
     }
 
+    /// Connect Redis on the dedicated RuntimeExecutor for synchronous callers.
+    pub fn connect_sync(config: RedisProviderConfig) -> CacheResult<Arc<Self>> {
+        if tokio::runtime::Handle::try_current().is_ok() {
+            return Err(CacheError::InvalidExecutionContext);
+        }
+        let executor = Arc::new(RuntimeExecutor::new()?);
+        let scripts = Arc::new(ScriptRegistry::default());
+        let provider_scripts = Arc::clone(&scripts);
+        let provider = executor.run(async move {
+            redis::RedisProvider::connect(config, provider_scripts)
+                .await
+                .map(|provider| Arc::new(provider) as Arc<dyn CacheProvider>)
+        })?;
+        Ok(Self::from_provider_with_parts(provider, scripts, executor))
+    }
+
     /// Load one provider through the versioned dynamic C ABI.
-    pub async fn dynamic(config: DynamicProviderConfig) -> CacheResult<Arc<Self>> {
-        let provider = dynamic::DynamicProvider::connect(config).await?;
-        Ok(Self::from_provider(Arc::new(provider)))
+    pub async fn dynamic(_config: DynamicProviderConfig) -> CacheResult<Arc<Self>> {
+        Err(CacheError::UnsupportedProvider(
+            "DynamicProvider is planned for a later release".into(),
+        ))
     }
 
     pub(crate) fn register_script(&self, definition: ScriptDefinition) -> CacheResult<()> {
         self.scripts.register(definition)
+    }
+
+    /// Read one value.
+    pub async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+        self.ensure_open()?;
+        self.provider.get(key).await
+    }
+
+    /// Store one value using Redis SET semantics.
+    pub async fn set(
+        &self,
+        key: &str,
+        value: Bytes,
+        options: SetOptions,
+    ) -> CacheResult<SetResult> {
+        self.ensure_open()?;
+        self.provider.set(key, value, options).await
+    }
+
+    /// Delete multiple keys and return the number removed.
+    pub async fn del(&self, keys: &[String]) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.del(keys).await
+    }
+
+    /// Read multiple keys while preserving input order.
+    pub async fn mget(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
+        self.ensure_open()?;
+        self.provider.mget(keys).await
+    }
+
+    /// Store multiple values.
+    pub async fn mset(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
+        self.ensure_open()?;
+        self.provider.mset(entries).await
+    }
+
+    /// Increment one integer value by one.
+    pub async fn incr(&self, key: &str) -> CacheResult<i64> {
+        self.incr_by(key, 1).await
+    }
+
+    /// Increment one integer value by `delta`.
+    pub async fn incr_by(&self, key: &str, delta: i64) -> CacheResult<i64> {
+        self.ensure_open()?;
+        self.provider.incr_by(key, delta).await
+    }
+
+    /// Decrement one integer value by one.
+    pub async fn decr(&self, key: &str) -> CacheResult<i64> {
+        self.incr_by(key, -1).await
+    }
+
+    /// Decrement one integer value by `delta`.
+    pub async fn decr_by(&self, key: &str, delta: i64) -> CacheResult<i64> {
+        let increment = delta.checked_neg().ok_or_else(|| {
+            CacheError::InvalidArgument("decrement delta is too large".to_string())
+        })?;
+        self.incr_by(key, increment).await
+    }
+
+    /// Check whether a set contains one member.
+    pub async fn sismember(&self, key: &str, member: &[u8]) -> CacheResult<bool> {
+        self.ensure_open()?;
+        self.provider.sismember(key, member).await
+    }
+
+    /// Return all members of one set in unspecified order.
+    pub async fn smembers(&self, key: &str) -> CacheResult<Vec<Bytes>> {
+        self.ensure_open()?;
+        self.provider.smembers(key).await
+    }
+
+    /// Return the cardinality of one set.
+    pub async fn scard(&self, key: &str) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.scard(key).await
+    }
+
+    /// Push values to the head of one list.
+    pub async fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.lpush(key, values).await
+    }
+
+    /// Push values to the tail of one list.
+    pub async fn rpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.rpush(key, values).await
+    }
+
+    /// Pop values from the head of one list.
+    pub async fn lpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        self.ensure_open()?;
+        self.provider.lpop(key, count).await
+    }
+
+    /// Pop values from the tail of one list.
+    pub async fn rpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        self.ensure_open()?;
+        self.provider.rpop(key, count).await
+    }
+
+    /// Return the length of one list.
+    pub async fn llen(&self, key: &str) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.llen(key).await
+    }
+
+    /// Return an inclusive range from one list.
+    pub async fn lrange(&self, key: &str, start: i64, stop: i64) -> CacheResult<Vec<Bytes>> {
+        self.ensure_open()?;
+        self.provider.lrange(key, start, stop).await
+    }
+
+    /// Return one list element by index.
+    pub async fn lindex(&self, key: &str, index: i64) -> CacheResult<Option<Bytes>> {
+        self.ensure_open()?;
+        self.provider.lindex(key, index).await
+    }
+
+    /// Replace one list element by index.
+    pub async fn lset(&self, key: &str, index: i64, value: Bytes) -> CacheResult<()> {
+        self.ensure_open()?;
+        self.provider.lset(key, index, value).await
+    }
+
+    /// Trim one list to an inclusive range.
+    pub async fn ltrim(&self, key: &str, start: i64, stop: i64) -> CacheResult<()> {
+        self.ensure_open()?;
+        self.provider.ltrim(key, start, stop).await
+    }
+
+    /// Remove matching elements from one list.
+    pub async fn lrem(&self, key: &str, count: i64, value: Bytes) -> CacheResult<u64> {
+        self.ensure_open()?;
+        self.provider.lrem(key, count, value).await
+    }
+
+    /// Insert one element relative to a pivot.
+    pub async fn linsert(&self, request: ListInsertRequest) -> CacheResult<i64> {
+        self.ensure_open()?;
+        self.provider.linsert(request).await
+    }
+
+    /// Atomically move one element between lists.
+    pub async fn lmove(&self, request: ListMoveRequest) -> CacheResult<Option<Bytes>> {
+        self.ensure_open()?;
+        self.provider.lmove(request).await
+    }
+
+    /// Execute one registered script.
+    pub async fn execute_script(&self, request: ScriptRequest) -> CacheResult<ScriptResult> {
+        self.ensure_open()?;
+        self.provider.execute_script(request).await
+    }
+
+    /// Check whether the provider is healthy.
+    pub async fn ping(&self) -> CacheResult<()> {
+        self.ensure_open()?;
+        self.provider.ping().await
     }
 
     /// Wrap the current Runtime with synchronous primitive operations.
@@ -123,108 +311,208 @@ impl CacheRuntime {
     }
 }
 
-#[async_trait]
-impl AsyncCacheRuntime for CacheRuntime {
-    async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        self.ensure_open()?;
-        self.provider.get(key).await
-    }
-
-    async fn put(&self, key: &str, value: Bytes, options: PutOptions) -> CacheResult<()> {
-        self.ensure_open()?;
-        self.provider.put(key, value, options).await
-    }
-
-    async fn delete(&self, key: &str) -> CacheResult<()> {
-        self.ensure_open()?;
-        self.provider.delete(key).await
-    }
-
-    async fn exists(&self, key: &str) -> CacheResult<bool> {
-        self.ensure_open()?;
-        self.provider.exists(key).await
-    }
-
-    async fn batch_get(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
-        self.ensure_open()?;
-        self.provider.batch_get(keys).await
-    }
-
-    async fn batch_put(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
-        self.ensure_open()?;
-        self.provider.batch_put(entries).await
-    }
-
-    async fn batch_delete(&self, keys: &[String]) -> CacheResult<()> {
-        self.ensure_open()?;
-        self.provider.batch_delete(keys).await
-    }
-
-    async fn execute_script(&self, request: ScriptRequest) -> CacheResult<ScriptResult> {
-        self.ensure_open()?;
-        self.provider.execute_script(request).await
-    }
-}
-
 /// Stateless synchronous facade over one CacheRuntime.
 pub struct SyncCacheRuntimeFacade {
     runtime: Arc<CacheRuntime>,
     executor: Arc<RuntimeExecutor>,
 }
 
-impl SyncCacheRuntime for SyncCacheRuntimeFacade {
-    fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+impl SyncCacheRuntimeFacade {
+    /// Read one value.
+    pub fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor.run(async move { runtime.get(&key).await })
+    }
+
+    /// Store one value using Redis SET semantics.
+    pub fn set(&self, key: &str, value: Bytes, options: SetOptions) -> CacheResult<SetResult> {
         let runtime = Arc::clone(&self.runtime);
         let key = key.to_string();
         self.executor
-            .run(async move { AsyncCacheRuntime::get(runtime.as_ref(), &key).await })
+            .run(async move { runtime.set(&key, value, options).await })
     }
 
-    fn put(&self, key: &str, value: Bytes, options: PutOptions) -> CacheResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        let key = key.to_string();
-        self.executor.run(async move {
-            AsyncCacheRuntime::put(runtime.as_ref(), &key, value, options).await
-        })
-    }
-
-    fn delete(&self, key: &str) -> CacheResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        let key = key.to_string();
-        self.executor
-            .run(async move { AsyncCacheRuntime::delete(runtime.as_ref(), &key).await })
-    }
-
-    fn exists(&self, key: &str) -> CacheResult<bool> {
-        let runtime = Arc::clone(&self.runtime);
-        let key = key.to_string();
-        self.executor
-            .run(async move { AsyncCacheRuntime::exists(runtime.as_ref(), &key).await })
-    }
-
-    fn batch_get(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
+    /// Delete multiple keys and return the number removed.
+    pub fn del(&self, keys: &[String]) -> CacheResult<u64> {
         let runtime = Arc::clone(&self.runtime);
         let keys = keys.to_vec();
-        self.executor
-            .run(async move { AsyncCacheRuntime::batch_get(runtime.as_ref(), &keys).await })
+        self.executor.run(async move { runtime.del(&keys).await })
     }
 
-    fn batch_put(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
-        let runtime = Arc::clone(&self.runtime);
-        self.executor
-            .run(async move { AsyncCacheRuntime::batch_put(runtime.as_ref(), entries).await })
-    }
-
-    fn batch_delete(&self, keys: &[String]) -> CacheResult<()> {
+    /// Read multiple keys while preserving input order.
+    pub fn mget(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
         let runtime = Arc::clone(&self.runtime);
         let keys = keys.to_vec();
-        self.executor
-            .run(async move { AsyncCacheRuntime::batch_delete(runtime.as_ref(), &keys).await })
+        self.executor.run(async move { runtime.mget(&keys).await })
     }
 
-    fn execute_script(&self, request: ScriptRequest) -> CacheResult<ScriptResult> {
+    /// Store multiple values.
+    pub fn mset(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
         let runtime = Arc::clone(&self.runtime);
         self.executor
-            .run(async move { AsyncCacheRuntime::execute_script(runtime.as_ref(), request).await })
+            .run(async move { runtime.mset(entries).await })
+    }
+
+    /// Increment one integer value by one.
+    pub fn incr(&self, key: &str) -> CacheResult<i64> {
+        self.incr_by(key, 1)
+    }
+
+    /// Increment one integer value by `delta`.
+    pub fn incr_by(&self, key: &str, delta: i64) -> CacheResult<i64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.incr_by(&key, delta).await })
+    }
+
+    /// Decrement one integer value by one.
+    pub fn decr(&self, key: &str) -> CacheResult<i64> {
+        self.incr_by(key, -1)
+    }
+
+    /// Decrement one integer value by `delta`.
+    pub fn decr_by(&self, key: &str, delta: i64) -> CacheResult<i64> {
+        let increment = delta.checked_neg().ok_or_else(|| {
+            CacheError::InvalidArgument("decrement delta is too large".to_string())
+        })?;
+        self.incr_by(key, increment)
+    }
+
+    /// Check whether a set contains one member.
+    pub fn sismember(&self, key: &str, member: &[u8]) -> CacheResult<bool> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        let member = member.to_vec();
+        self.executor
+            .run(async move { runtime.sismember(&key, &member).await })
+    }
+
+    /// Return all members of one set in unspecified order.
+    pub fn smembers(&self, key: &str) -> CacheResult<Vec<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.smembers(&key).await })
+    }
+
+    /// Return the cardinality of one set.
+    pub fn scard(&self, key: &str) -> CacheResult<u64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor.run(async move { runtime.scard(&key).await })
+    }
+
+    /// Push values to the head of one list.
+    pub fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lpush(&key, values).await })
+    }
+
+    /// Push values to the tail of one list.
+    pub fn rpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.rpush(&key, values).await })
+    }
+
+    /// Pop values from the head of one list.
+    pub fn lpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lpop(&key, count).await })
+    }
+
+    /// Pop values from the tail of one list.
+    pub fn rpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.rpop(&key, count).await })
+    }
+
+    /// Return the length of one list.
+    pub fn llen(&self, key: &str) -> CacheResult<u64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor.run(async move { runtime.llen(&key).await })
+    }
+
+    /// Return an inclusive range from one list.
+    pub fn lrange(&self, key: &str, start: i64, stop: i64) -> CacheResult<Vec<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lrange(&key, start, stop).await })
+    }
+
+    /// Return one list element by index.
+    pub fn lindex(&self, key: &str, index: i64) -> CacheResult<Option<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lindex(&key, index).await })
+    }
+
+    /// Replace one list element by index.
+    pub fn lset(&self, key: &str, index: i64, value: Bytes) -> CacheResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lset(&key, index, value).await })
+    }
+
+    /// Trim one list to an inclusive range.
+    pub fn ltrim(&self, key: &str, start: i64, stop: i64) -> CacheResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.ltrim(&key, start, stop).await })
+    }
+
+    /// Remove matching elements from one list.
+    pub fn lrem(&self, key: &str, count: i64, value: Bytes) -> CacheResult<u64> {
+        let runtime = Arc::clone(&self.runtime);
+        let key = key.to_string();
+        self.executor
+            .run(async move { runtime.lrem(&key, count, value).await })
+    }
+
+    /// Insert one element relative to a pivot.
+    pub fn linsert(&self, request: ListInsertRequest) -> CacheResult<i64> {
+        let runtime = Arc::clone(&self.runtime);
+        self.executor
+            .run(async move { runtime.linsert(request).await })
+    }
+
+    /// Atomically move one element between lists.
+    pub fn lmove(&self, request: ListMoveRequest) -> CacheResult<Option<Bytes>> {
+        let runtime = Arc::clone(&self.runtime);
+        self.executor
+            .run(async move { runtime.lmove(request).await })
+    }
+
+    /// Execute one registered script.
+    pub fn execute_script(&self, request: ScriptRequest) -> CacheResult<ScriptResult> {
+        let runtime = Arc::clone(&self.runtime);
+        self.executor
+            .run(async move { runtime.execute_script(request).await })
+    }
+
+    /// Check whether the provider is healthy.
+    pub fn ping(&self) -> CacheResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        self.executor.run(async move { runtime.ping().await })
+    }
+
+    /// Close the shared runtime.
+    pub fn close(&self) -> CacheResult<()> {
+        let runtime = Arc::clone(&self.runtime);
+        self.executor.run(async move { runtime.close().await })
     }
 }

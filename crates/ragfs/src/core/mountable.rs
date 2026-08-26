@@ -1708,7 +1708,7 @@ mod tests {
     #[tokio::test]
     async fn encrypted_mount_caches_ciphertext_below_account_validation() {
         use crate::cache::{CacheNamespace, CachePolicy};
-        use crate::cache_runtime::{AsyncCacheRuntime, CacheRuntime, MemoryMockProvider};
+        use crate::cache_runtime::{CacheRuntime, MemoryMockProvider};
         use crate::core::{FsContextInner, FS_CTX};
         use crate::lock::{
             MemoryPathLockProvider, PathLockConfig, PathLockManager, PathLockProvider,

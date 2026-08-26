@@ -1111,18 +1111,71 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 
 更多配置示例见 [多写存储指南](./13-multi-write-storage.md)。
 
+##### 全局 Cache Provider 与 CacheFS 配置
+
+全局 `cache` 与 `storage` 并列，标准配置只包含 Provider 名称和 Provider 自有参数：
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `provider` | str | 全局 Cache Provider；本期支持 `redis` | 必填 |
+| `params` | object | Provider 自有参数；当 `provider=redis` 时解析为 Redis 连接参数 | `{}` |
+
+`storage.agfs.cachefs` 只控制 CacheFS 业务行为：
+
+| 参数 | 类型 | 说明 | 默认值 |
+|------|------|------|--------|
+| `backend` | str | `local` 完全沿用原文件系统；`cache` 启用 CacheFS wrapper | `local` |
+| `namespace` | str | CacheFS key 命名空间 | `openviking` |
+| `max_file_size_bytes` | int | 允许缓存的单文件最大字节数 | `1048576` |
+| `traversal_mode` | str | `backend` 或 `cached_traversal` | `backend` |
+| `bypass_prefixes` | array[str] | 绕过缓存的路径前缀 | `[]` |
+
+```json
+{
+  "cache": {
+    "provider": "redis",
+    "params": {
+      "mode": "sentinel",
+      "endpoints": [
+        "redis://sentinel-1:26379",
+        "redis://sentinel-2:26379"
+      ],
+      "master_name": "mymaster",
+      "password_env": "OPENVIKING_REDIS_PASSWORD",
+      "connect_timeout_ms": 1000,
+      "command_timeout_ms": 1000
+    }
+  },
+  "storage": {
+    "agfs": {
+      "cachefs": {
+        "backend": "cache",
+        "namespace": "production"
+      },
+      "queuefs": {
+        "backend": "cache",
+        "cache_key_prefix": "production"
+      }
+    }
+  }
+}
+```
+
+标准配置没有全局 `cache.enabled`。当 CacheFS 或 QueueFS 选择 `backend=cache` 时初始化 CacheRuntime；全部模块使用本地 backend 时不解析 `cache.params`，也不连接 Provider。
+
 ##### QueueFS 配置
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `mode` | str | QueueFS 命名空间模式：`"shared"` 使用 `/queue`；`"worker"` 为每个 worker 隔离到 `/queue/worker-<index\|pid>` | `"shared"` |
-| `backend` | str | QueueFS 后端：`"memory"`、`"sqlite"`、`"sqlite3"` 或 `"redis"` | `"sqlite"` |
+| `backend` | str | QueueFS 后端：`"memory"`、`"sqlite"`、`"sqlite3"` 或 `"cache"`；`"redis"` 为旧配置兼容值 | `"sqlite"` |
 | `db_path` | str（可选） | 当 backend 为 `"sqlite"` 或 `"sqlite3"` 时使用的 QueueFS sqlite 数据库路径 | `null` |
 | `recover_stale_sec` | int | 启动时恢复超过该秒数的 `processing` 队列消息；`0` 表示恢复全部 stale processing 消息 | `0` |
 | `busy_timeout_ms` | int | QueueFS sqlite 的 busy timeout，单位毫秒 | `5000` |
-| `redis` | object | 当 backend 为 `"redis"` 时使用的连接参数 | 见下表 |
+| `cache_key_prefix` | str | 当 backend 为 `"cache"` 时使用的 QueueFS key 命名空间 | `"default"` |
+| `redis` | object | 旧 `backend=redis` 的兼容连接参数；新配置使用顶层 `cache.params` | 见下表 |
 
-QueueFS Redis 参数：
+旧 QueueFS Redis 参数（仅兼容）：
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
@@ -1147,11 +1200,11 @@ QueueFS Redis 参数：
 - `db_path` 仅在 QueueFS backend 为 `sqlite` 或 `sqlite3` 时生效。
 - `recover_stale_sec` 和 `busy_timeout_ms` 仅在 QueueFS backend 为 `sqlite` 或 `sqlite3` 时生效。
 - Redis Singleton 模式必须且只能配置一个 endpoint。
-- Redis Cluster 模式的 endpoints 是初始节点，且必须配置 `db=0`；slot 路由、`MOVED`/`ASK` 处理和节点重连由 redis-rs 完成。
-- Redis Sentinel 模式的 endpoints 是 Sentinel 节点，并且必须配置非空 `master_name`；master 发现和故障切换后的重连由 redis-rs 完成。
-- Redis Sentinel 模式下，`connect_timeout_ms` 作用于发现 Master 后的数据节点连接；redis-rs 同步 Sentinel discovery 不暴露物理建连 timeout，该阶段由内部固定 5 秒的 pool checkout timeout 限制调用方等待。
+- 新配置使用 `queuefs.backend=cache`，并自动绑定顶层 `cache.provider + cache.params`。
+- Redis Cluster 模式的 endpoints 是初始节点，且必须配置 `db=0`；slot 路由、`MOVED`/`ASK`、拓扑更新和重连由 Fred RedisProvider 处理。
+- Redis Sentinel 模式的 endpoints 是 Sentinel 节点，并且必须配置非空 `master_name`；master 发现和故障切换后的重连由 Fred RedisProvider 处理。
 - `username` 和 `password` 用于 Redis 数据节点；`sentinel_username` 和 `sentinel_password` 仅用于 Sentinel 节点。
-- Redis backend 使用 `{key_prefix}:ov:*` key；连接同一 Redis database 的不同业务必须配置不同的 `key_prefix`。
+- Cache backend 使用 `{cache_key_prefix}:ov:*` key；连接同一 Redis 集群的不同环境或租户必须配置不同的 `cache_key_prefix`。
 - Redis backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。
 - Redis backend 会在独立的 startup recovery 线程中按实例心跳状态执行三次有界 `recover_stale` 扫描，时间点分别为启动后立即、30 秒和 60 秒，用于覆盖容器异常退出后旧实例心跳尚未过期的恢复窗口；运行期间不做长期周期恢复。
 - `tls_insecure_skip_verify=true` 时必须同时设置 `tls_enabled=true`。
@@ -1176,7 +1229,7 @@ QueueFS Redis 参数：
 }
 ```
 
-Redis QueueFS 配置示例：
+旧 Redis QueueFS 兼容配置示例（新配置不推荐使用）：
 
 ```json
 {
@@ -1208,7 +1261,7 @@ Redis QueueFS 配置示例：
 }
 ```
 
-Redis Cluster 只需配置可用于发现拓扑的初始节点：
+旧 Redis QueueFS Cluster 兼容配置：
 
 ```json
 {
@@ -1234,7 +1287,7 @@ Redis Cluster 只需配置可用于发现拓扑的初始节点：
 }
 ```
 
-Redis Sentinel 分别配置数据节点和 Sentinel 的 ACL：
+旧 Redis QueueFS Sentinel 兼容配置：
 
 ```json
 {

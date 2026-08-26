@@ -286,14 +286,22 @@ struct DynamicCacheConfig {
 struct RedisCacheConfig {
     mode: String,
     endpoints: Vec<String>,
+    master_name: Option<String>,
     username: String,
     password_env: String,
+    password: String,
+    sentinel_username: String,
+    sentinel_password_env: String,
+    sentinel_password: String,
+    db: i64,
     pool_size: usize,
     connect_timeout_ms: u64,
     command_timeout_ms: u64,
     key_prefix: String,
     default_ttl_seconds: u64,
     read_from_replica: bool,
+    tls_enabled: bool,
+    tls_insecure_skip_verify: bool,
 }
 
 impl Default for RagfsCacheConfig {
@@ -326,14 +334,22 @@ impl Default for RedisCacheConfig {
         Self {
             mode: "standalone".to_string(),
             endpoints: vec!["redis://127.0.0.1:6379".to_string()],
+            master_name: None,
             username: String::new(),
             password_env: String::new(),
+            password: String::new(),
+            sentinel_username: String::new(),
+            sentinel_password_env: String::new(),
+            sentinel_password: String::new(),
+            db: 0,
             pool_size: 32,
             connect_timeout_ms: 1_000,
             command_timeout_ms: 20,
             key_prefix: String::new(),
             default_ttl_seconds: 3_600,
             read_from_replica: false,
+            tls_enabled: false,
+            tls_insecure_skip_verify: false,
         }
     }
 }
@@ -347,14 +363,22 @@ impl RagfsCacheConfig {
             CacheProviderKind::Redis => CacheRuntimeProviderConfig::Redis(RedisProviderConfig {
                 mode: self.redis.mode.clone(),
                 endpoints: self.redis.endpoints.clone(),
+                master_name: self.redis.master_name.clone(),
                 username: self.redis.username.clone(),
                 password_env: self.redis.password_env.clone(),
+                password: self.redis.password.clone(),
+                sentinel_username: self.redis.sentinel_username.clone(),
+                sentinel_password_env: self.redis.sentinel_password_env.clone(),
+                sentinel_password: self.redis.sentinel_password.clone(),
+                db: self.redis.db,
                 pool_size: self.redis.pool_size,
                 connect_timeout_ms: self.redis.connect_timeout_ms,
                 command_timeout_ms: self.redis.command_timeout_ms,
                 key_prefix: self.redis.key_prefix.clone(),
                 default_ttl_seconds: self.redis.default_ttl_seconds,
                 read_from_replica: self.redis.read_from_replica,
+                tls_enabled: self.redis.tls_enabled,
+                tls_insecure_skip_verify: self.redis.tls_insecure_skip_verify,
             }),
             CacheProviderKind::Dynamic => {
                 CacheRuntimeProviderConfig::Dynamic(DynamicProviderConfig {
@@ -381,35 +405,197 @@ fn cache_config_from_ov_conf(path: &str) -> Result<RagfsCacheConfig, String> {
     let json: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| format!("failed to parse OpenViking config {path}: {error}"))?;
 
-    let configured_provider = json
-        .get("storage")
-        .and_then(|storage| storage.get("agfs"))
+    let agfs = json.get("storage").and_then(|storage| storage.get("agfs"));
+    let configured_provider = agfs
         .and_then(|agfs| agfs.get("cache"))
         .and_then(|cache| cache.get("provider"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("redis");
 
-    let mut config = match json
-        .get("storage")
-        .and_then(|storage| storage.get("agfs"))
-        .and_then(|agfs| agfs.get("cache"))
-    {
+    let mut config = match agfs.and_then(|agfs| agfs.get("cache")) {
         Some(cache) => cache_config_from_value(cache),
         None => Ok(RagfsCacheConfig::default()),
     }?;
-    if json
-        .get("storage")
-        .and_then(|storage| storage.get("agfs"))
+    let queuefs_backend = agfs
         .and_then(|agfs| agfs.get("queuefs"))
         .and_then(|queuefs| queuefs.get("backend"))
-        .and_then(serde_json::Value::as_str)
-        == Some("cache")
-    {
-        config.runtime_enabled = true;
-        config.provider = provider_kind(configured_provider.to_string())?;
+        .and_then(serde_json::Value::as_str);
+    match queuefs_backend {
+        Some("cache") => {
+            config.runtime_enabled = true;
+            config.provider = provider_kind(configured_provider.to_string())?;
+        }
+        Some("redis") => {
+            if configured_provider != "redis"
+                && agfs
+                    .and_then(|agfs| agfs.get("cache"))
+                    .and_then(serde_json::Value::as_object)
+                    .is_some_and(|cache| cache.contains_key("provider"))
+            {
+                return Err(
+                    "queuefs backend=redis conflicts with the global cache provider".to_string(),
+                );
+            }
+            config.runtime_enabled = true;
+            config.provider = CacheProviderKind::Redis;
+            merge_legacy_queuefs_redis_config(&mut config, agfs)?;
+        }
+        _ => {}
     }
     validate_cache_runtime_config(&config)?;
     Ok(config)
+}
+
+fn merge_legacy_queuefs_redis_config(
+    config: &mut RagfsCacheConfig,
+    agfs: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let cache_redis = agfs
+        .and_then(|agfs| agfs.get("cache"))
+        .and_then(|cache| cache.get("redis"))
+        .and_then(serde_json::Value::as_object);
+    let legacy_redis = agfs
+        .and_then(|agfs| agfs.get("queuefs"))
+        .and_then(|queuefs| queuefs.get("redis"))
+        .map(|redis| {
+            redis
+                .as_object()
+                .ok_or_else(|| "storage.agfs.queuefs.redis must be an object".to_string())
+        })
+        .transpose()?;
+    let empty = serde_json::Map::new();
+    let legacy_redis = legacy_redis.unwrap_or(&empty);
+
+    let legacy_mode = match string_field(legacy_redis, "mode", "singleton")?.as_str() {
+        "singleton" => "standalone".to_string(),
+        value => value.to_string(),
+    };
+    let current_mode = match config.redis.mode.as_str() {
+        "singleton" => "standalone",
+        value => value,
+    };
+    if merge_legacy_field(
+        "mode",
+        cache_redis,
+        legacy_redis,
+        current_mode == legacy_mode,
+    )? {
+        config.redis.mode = legacy_mode;
+    }
+
+    let legacy_endpoints = string_array_field_or_default(
+        legacy_redis,
+        "endpoints",
+        &["redis://127.0.0.1:6379".to_string()],
+    )?;
+    if merge_legacy_field(
+        "endpoints",
+        cache_redis,
+        legacy_redis,
+        config.redis.endpoints == legacy_endpoints,
+    )? {
+        config.redis.endpoints = legacy_endpoints;
+    }
+
+    let legacy_master_name = optional_string_field(legacy_redis, "master_name")?;
+    if merge_legacy_field(
+        "master_name",
+        cache_redis,
+        legacy_redis,
+        config.redis.master_name == legacy_master_name,
+    )? {
+        config.redis.master_name = legacy_master_name;
+    }
+
+    macro_rules! merge_string {
+        ($field:ident) => {{
+            let value =
+                optional_string_field(legacy_redis, stringify!($field))?.unwrap_or_default();
+            if merge_legacy_field(
+                stringify!($field),
+                cache_redis,
+                legacy_redis,
+                config.redis.$field == value,
+            )? {
+                config.redis.$field = value;
+            }
+        }};
+    }
+    merge_string!(username);
+    merge_string!(password);
+    merge_string!(sentinel_username);
+    merge_string!(sentinel_password);
+
+    macro_rules! merge_i64 {
+        ($field:ident, $default:expr) => {{
+            let value = i64_field(legacy_redis, stringify!($field), $default)?;
+            if merge_legacy_field(
+                stringify!($field),
+                cache_redis,
+                legacy_redis,
+                config.redis.$field == value,
+            )? {
+                config.redis.$field = value;
+            }
+        }};
+    }
+    merge_i64!(db, 0);
+
+    macro_rules! merge_u64 {
+        ($field:ident, $default:expr) => {{
+            let value = u64_field(legacy_redis, stringify!($field), $default)?;
+            if merge_legacy_field(
+                stringify!($field),
+                cache_redis,
+                legacy_redis,
+                config.redis.$field == value,
+            )? {
+                config.redis.$field = value;
+            }
+        }};
+    }
+    merge_u64!(connect_timeout_ms, 3_000);
+    merge_u64!(command_timeout_ms, 3_000);
+
+    macro_rules! merge_bool {
+        ($field:ident) => {{
+            let value = bool_field(legacy_redis, stringify!($field), false)?;
+            if merge_legacy_field(
+                stringify!($field),
+                cache_redis,
+                legacy_redis,
+                config.redis.$field == value,
+            )? {
+                config.redis.$field = value;
+            }
+        }};
+    }
+    merge_bool!(tls_enabled);
+    merge_bool!(tls_insecure_skip_verify);
+
+    if !config.redis.password.is_empty() && !config.redis.password_env.is_empty() {
+        return Err("conflicting Redis setting: password".to_string());
+    }
+    if !config.redis.sentinel_password.is_empty() && !config.redis.sentinel_password_env.is_empty()
+    {
+        return Err("conflicting Redis setting: sentinel_password".to_string());
+    }
+    Ok(())
+}
+
+fn merge_legacy_field(
+    field: &str,
+    global: Option<&serde_json::Map<String, serde_json::Value>>,
+    legacy: &serde_json::Map<String, serde_json::Value>,
+    values_match: bool,
+) -> Result<bool, String> {
+    let global_explicit = global.is_some_and(|global| global.contains_key(field));
+    let legacy_explicit = legacy.contains_key(field);
+    if global_explicit && legacy_explicit && !values_match {
+        Err(format!("conflicting Redis setting: {field}"))
+    } else {
+        Ok(legacy_explicit || !global_explicit)
+    }
 }
 
 fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig, String> {
@@ -448,9 +634,21 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
         config.redis.mode = string_field(redis, "mode", &config.redis.mode)?;
         config.redis.endpoints =
             string_array_field_or_default(redis, "endpoints", &config.redis.endpoints)?;
+        config.redis.master_name = optional_string_field(redis, "master_name")?;
         config.redis.username = string_field(redis, "username", &config.redis.username)?;
         config.redis.password_env =
             string_field(redis, "password_env", &config.redis.password_env)?;
+        config.redis.password = string_field(redis, "password", &config.redis.password)?;
+        config.redis.sentinel_username =
+            string_field(redis, "sentinel_username", &config.redis.sentinel_username)?;
+        config.redis.sentinel_password_env = string_field(
+            redis,
+            "sentinel_password_env",
+            &config.redis.sentinel_password_env,
+        )?;
+        config.redis.sentinel_password =
+            string_field(redis, "sentinel_password", &config.redis.sentinel_password)?;
+        config.redis.db = i64_field(redis, "db", config.redis.db)?;
         config.redis.pool_size = usize_field(redis, "pool_size", config.redis.pool_size)?;
         config.redis.connect_timeout_ms =
             u64_field(redis, "connect_timeout_ms", config.redis.connect_timeout_ms)?;
@@ -464,6 +662,12 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
         )?;
         config.redis.read_from_replica =
             bool_field(redis, "read_from_replica", config.redis.read_from_replica)?;
+        config.redis.tls_enabled = bool_field(redis, "tls_enabled", config.redis.tls_enabled)?;
+        config.redis.tls_insecure_skip_verify = bool_field(
+            redis,
+            "tls_insecure_skip_verify",
+            config.redis.tls_insecure_skip_verify,
+        )?;
     }
 
     if let Some(dynamic) = cache.get("dynamic") {
@@ -545,6 +749,32 @@ fn string_field(
             .map(ToOwned::to_owned)
             .ok_or_else(|| format!("{key} must be a string")),
         None => Ok(default.to_string()),
+    }
+}
+
+fn optional_string_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+) -> Result<Option<String>, String> {
+    match object.get(key) {
+        Some(serde_json::Value::Null) | None => Ok(None),
+        Some(value) => value
+            .as_str()
+            .map(|value| Some(value.to_string()))
+            .ok_or_else(|| format!("{key} must be a string or null")),
+    }
+}
+
+fn i64_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    default: i64,
+) -> Result<i64, String> {
+    match object.get(key) {
+        Some(value) => value
+            .as_i64()
+            .ok_or_else(|| format!("{key} must be an integer")),
+        None => Ok(default),
     }
 }
 
@@ -2839,6 +3069,84 @@ mod tests {
 
         assert!(cache_config.runtime_enabled);
         assert!(!stack_config.cachefs.enabled);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_queuefs_redis_config_initializes_the_shared_runtime() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-legacy-queue-redis-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "queuefs": {
+                            "backend": "redis",
+                            "redis": {
+                                "mode": "singleton",
+                                "endpoints": ["redis://redis.example.com:6379"],
+                                "username": "queue-user",
+                                "password": "legacy-secret",
+                                "db": 2,
+                                "connect_timeout_ms": 1500,
+                                "command_timeout_ms": 2500,
+                                "key_prefix": "tenant-a"
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert!(cache_config.runtime_enabled);
+        assert!(!cache_config.enabled);
+        assert_eq!(cache_config.provider, CacheProviderKind::Redis);
+        assert_eq!(cache_config.redis.mode, "standalone");
+        assert_eq!(
+            cache_config.redis.endpoints,
+            vec!["redis://redis.example.com:6379"]
+        );
+        assert_eq!(cache_config.redis.username, "queue-user");
+        assert_eq!(cache_config.redis.password, "legacy-secret");
+        assert_eq!(cache_config.redis.db, 2);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_queuefs_redis_rejects_conflicting_global_settings() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-conflicting-queue-redis-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "cache": {
+                            "provider": "redis",
+                            "redis": {"endpoints": ["redis://global.example.com:6379"]}
+                        },
+                        "queuefs": {
+                            "backend": "redis",
+                            "redis": {"endpoints": ["redis://legacy.example.com:6379"]}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let error = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap_err();
+        assert!(error.contains("conflicting Redis setting: endpoints"));
 
         fs::remove_file(path).unwrap();
     }

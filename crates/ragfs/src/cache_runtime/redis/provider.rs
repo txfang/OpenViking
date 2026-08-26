@@ -1,7 +1,8 @@
 use super::{RedisClient, RedisProviderConfig};
 use crate::cache_runtime::provider::CacheProvider;
 use crate::cache_runtime::{
-    CacheError, CacheResult, PutOptions, ScriptRegistry, ScriptRequest, ScriptResult,
+    CacheResult, ListInsertRequest, ListMoveRequest, ScriptRegistry, ScriptRequest, ScriptResult,
+    SetOptions, SetResult,
 };
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -32,75 +33,99 @@ impl RedisProvider {
             default_ttl,
         })
     }
-
-    fn ttl_ms(&self, options: PutOptions) -> CacheResult<Option<u64>> {
-        options
-            .ttl
-            .or(self.default_ttl)
-            .map(|ttl| {
-                u64::try_from(ttl.as_millis())
-                    .map_err(|_| CacheError::InvalidArgument("Redis TTL is too large".to_string()))
-            })
-            .transpose()
-    }
 }
 
 #[async_trait]
 impl CacheProvider for RedisProvider {
     async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        Ok(self.client.get(key.to_string()).await?.map(Bytes::from))
+        self.client.get(key).await
     }
 
-    async fn put(&self, key: &str, value: Bytes, options: PutOptions) -> CacheResult<()> {
-        self.client
-            .set(key.to_string(), value.to_vec(), self.ttl_ms(options)?)
-            .await
+    async fn set(&self, key: &str, value: Bytes, options: SetOptions) -> CacheResult<SetResult> {
+        self.client.set(key, value, options, self.default_ttl).await
     }
 
-    async fn delete(&self, key: &str) -> CacheResult<()> {
-        self.client.delete(key.to_string()).await
+    async fn del(&self, keys: &[String]) -> CacheResult<u64> {
+        self.client.del(keys).await
     }
 
-    async fn exists(&self, key: &str) -> CacheResult<bool> {
-        self.client.exists(key.to_string()).await
+    async fn mget(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
+        self.client.mget(keys).await
     }
 
-    async fn batch_get(&self, keys: &[String]) -> CacheResult<Vec<Option<Bytes>>> {
-        Ok(self
-            .client
-            .batch_get(keys.to_vec())
-            .await?
-            .into_iter()
-            .map(|value| value.map(Bytes::from))
-            .collect())
+    async fn mset(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
+        self.client.mset(entries, self.default_ttl).await
     }
 
-    async fn batch_put(&self, entries: Vec<(String, Bytes)>) -> CacheResult<()> {
-        let ttl_ms = self.ttl_ms(PutOptions::default())?;
-        self.client
-            .batch_set(
-                entries
-                    .into_iter()
-                    .map(|(key, value)| (key, value.to_vec()))
-                    .collect(),
-                ttl_ms,
-            )
-            .await
+    async fn incr_by(&self, key: &str, delta: i64) -> CacheResult<i64> {
+        self.client.incr_by(key, delta).await
     }
 
-    async fn batch_delete(&self, keys: &[String]) -> CacheResult<()> {
-        self.client.batch_delete(keys.to_vec()).await
+    async fn sismember(&self, key: &str, member: &[u8]) -> CacheResult<bool> {
+        self.client.sismember(key, member).await
+    }
+
+    async fn smembers(&self, key: &str) -> CacheResult<Vec<Bytes>> {
+        self.client.smembers(key).await
+    }
+
+    async fn scard(&self, key: &str) -> CacheResult<u64> {
+        self.client.scard(key).await
+    }
+
+    async fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        self.client.lpush(key, values).await
+    }
+
+    async fn rpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
+        self.client.rpush(key, values).await
+    }
+
+    async fn lpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        self.client.lpop(key, count).await
+    }
+
+    async fn rpop(&self, key: &str, count: Option<u64>) -> CacheResult<Vec<Bytes>> {
+        self.client.rpop(key, count).await
+    }
+
+    async fn llen(&self, key: &str) -> CacheResult<u64> {
+        self.client.llen(key).await
+    }
+
+    async fn lrange(&self, key: &str, start: i64, stop: i64) -> CacheResult<Vec<Bytes>> {
+        self.client.lrange(key, start, stop).await
+    }
+
+    async fn lindex(&self, key: &str, index: i64) -> CacheResult<Option<Bytes>> {
+        self.client.lindex(key, index).await
+    }
+
+    async fn lset(&self, key: &str, index: i64, value: Bytes) -> CacheResult<()> {
+        self.client.lset(key, index, value).await
+    }
+
+    async fn ltrim(&self, key: &str, start: i64, stop: i64) -> CacheResult<()> {
+        self.client.ltrim(key, start, stop).await
+    }
+
+    async fn lrem(&self, key: &str, count: i64, value: Bytes) -> CacheResult<u64> {
+        self.client.lrem(key, count, value).await
+    }
+
+    async fn linsert(&self, request: ListInsertRequest) -> CacheResult<i64> {
+        self.client.linsert(request).await
+    }
+
+    async fn lmove(&self, request: ListMoveRequest) -> CacheResult<Option<Bytes>> {
+        self.client.lmove(request).await
     }
 
     async fn execute_script(&self, request: ScriptRequest) -> CacheResult<ScriptResult> {
         let lua = self.scripts.resolve(&request.script_id)?;
         let value = self
             .client
-            .execute_script(
-                lua,
-                request.keys,
-                request.args.into_iter().map(|arg| arg.to_vec()).collect(),
-            )
+            .execute_script(&request.script_id, lua, request.keys, request.args)
             .await?;
         ScriptResult::encode(&value)
     }
@@ -113,7 +138,7 @@ impl CacheProvider for RedisProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache_runtime::{AsyncCacheRuntime, ScriptDefinition, ScriptRequest, ScriptValue};
+    use crate::cache_runtime::{ScriptDefinition, ScriptRequest, ScriptValue};
 
     #[tokio::test]
     async fn executes_registered_script_and_recovers_after_script_flush() {
@@ -158,5 +183,58 @@ mod tests {
         provider.client.script_flush().await.unwrap();
         let second = runtime.execute_script(request).await.unwrap();
         assert_eq!(second.decode().unwrap(), first.decode().unwrap());
+    }
+
+    #[tokio::test]
+    async fn set_queries_preserve_binary_members_on_real_redis() {
+        let Ok(endpoint) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let scripts = Arc::new(crate::cache_runtime::ScriptRegistry::default());
+        scripts
+            .register(ScriptDefinition {
+                id: "runtime.test.sadd.v1",
+                redis_lua: "return redis.call('SADD', KEYS[1], ARGV[1], ARGV[2])",
+            })
+            .unwrap();
+        let config = RedisProviderConfig {
+            endpoints: vec![endpoint],
+            key_prefix: String::new(),
+            command_timeout_ms: 1_000,
+            ..RedisProviderConfig::default()
+        };
+        let provider = Arc::new(
+            RedisProvider::connect(config, Arc::clone(&scripts))
+                .await
+                .unwrap(),
+        );
+        let runtime = crate::cache_runtime::CacheRuntime::from_provider(provider);
+        let set_key = format!("ragfs-set-test:{}:members", std::process::id());
+        let binary_member = Bytes::from_static(b"binary\0member");
+        let text_member = Bytes::from_static(b"text-member");
+
+        runtime
+            .execute_script(ScriptRequest {
+                script_id: "runtime.test.sadd.v1".into(),
+                keys: vec![set_key.clone()],
+                args: vec![binary_member.clone(), text_member.clone()],
+            })
+            .await
+            .unwrap();
+
+        assert!(runtime
+            .sismember(&set_key, binary_member.as_ref())
+            .await
+            .unwrap());
+        assert!(!runtime.sismember(&set_key, b"missing").await.unwrap());
+        assert_eq!(runtime.scard(&set_key).await.unwrap(), 2);
+        let mut members = runtime.smembers(&set_key).await.unwrap();
+        members.sort();
+        let mut expected = vec![binary_member, text_member];
+        expected.sort();
+        assert_eq!(members, expected);
+
+        runtime.del(&[set_key]).await.unwrap();
+        runtime.close().await.unwrap();
     }
 }

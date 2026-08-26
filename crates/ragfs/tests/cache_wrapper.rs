@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use ragfs::cache::{
     CacheDecision, CacheNamespace, CachePolicy, CacheTraversalMode, CachedFileSystem,
 };
-use ragfs::cache_runtime::{AsyncCacheRuntime, CacheRuntime, MemoryMockProvider};
+use ragfs::cache_runtime::{CacheRuntime, MemoryMockProvider};
 use ragfs::core::{FsContextInner, GrepResult, MultiWriteWrappedFS, TreeEntry, FS_CTX};
 use ragfs::plugins::MemFileSystem;
 use ragfs::{Error, FileInfo, FileSystem, Result, WriteFlag};
@@ -1144,7 +1144,7 @@ async fn provider_generation_eviction_after_restart_cannot_revive_old_descendant
 
     for key in provider.keys().await {
         if key.contains(":subtree:") {
-            first_runtime.delete(&key).await.unwrap();
+            first_runtime.del(&[key]).await.unwrap();
         }
     }
     drop(first);
@@ -1296,6 +1296,50 @@ async fn unavailable_provider_falls_back_to_backend_and_enters_bypass() {
     let metrics = fs.metrics().snapshot();
     assert!(metrics.errors >= 2);
     assert!(metrics.policy_bypasses >= 1);
+}
+
+#[tokio::test]
+async fn generation_backfill_is_bounded_and_continues_after_one_set_failure() {
+    let backend = CountingFileSystem::new();
+    let mut current = String::new();
+    for component in ["a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l"] {
+        current.push('/');
+        current.push_str(component);
+        backend.mkdir(&current, 0o755).await.unwrap();
+    }
+    let path = "/a/b/c/d/e/f/g/h/i/j/k/l/file.md";
+    backend
+        .write(path, b"generation", 0, WriteFlag::Create)
+        .await
+        .unwrap();
+
+    let provider = Arc::new(MemoryMockProvider::new().with_set_delay(Duration::from_millis(20)));
+    provider.fail_next_set_matching(":subtree:");
+    let fs = CachedFileSystem::with_runtime(
+        Box::new(backend),
+        CacheRuntime::memory_with_provider(Arc::clone(&provider)),
+        CacheNamespace::new("generation-set-failure"),
+        CachePolicy::default(),
+    );
+
+    assert_eq!(fs.read(path, 0, 0).await.unwrap(), b"generation");
+
+    let keys = provider.keys().await;
+    assert_eq!(
+        keys.iter().filter(|key| key.contains(":subtree:")).count(),
+        13,
+        "one of the fourteen ancestor generation writes should fail"
+    );
+    assert_eq!(
+        keys.iter().filter(|key| key.contains(":file:")).count(),
+        1,
+        "a generation write failure must not prevent the file cache fill"
+    );
+    assert_eq!(fs.metrics().snapshot().errors, 1);
+    assert!(
+        (2..=8).contains(&provider.max_concurrent_sets()),
+        "generation writes should run concurrently with a fixed upper bound"
+    );
 }
 
 #[tokio::test]

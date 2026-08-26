@@ -2,7 +2,7 @@
 
 use super::envelope::{CacheEnvelope, CacheObjectKind, GenerationSnapshot};
 use super::{CacheMetrics, CachePolicy, CacheTraversalMode};
-use crate::cache_runtime::{AsyncCacheRuntime, CacheError, CacheResult, CacheRuntime, PutOptions};
+use crate::cache_runtime::{CacheError, CacheResult, CacheRuntime, SetOptions, SetResult};
 use crate::core::filesystem::{
     compile_grep_regex, is_excluded_path, normalize_prefix_path, relative_depth,
     relative_match_file, sort_directory_entries,
@@ -22,6 +22,7 @@ use tokio::sync::{Mutex, RwLock};
 use uuid::Uuid;
 
 const GREP_CACHE_FILE_CONCURRENCY: usize = 8;
+const GENERATION_PUT_CONCURRENCY: usize = 8;
 
 /// Namespace prepended to every provider key owned by one wrapper.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -396,7 +397,7 @@ impl CachedFileSystem {
         }
 
         let started = Instant::now();
-        let result = self.runtime.batch_get(keys).await;
+        let result = self.runtime.mget(keys).await;
         self.metrics.get(started.elapsed());
         let values = result?;
         if values.len() != keys.len() {
@@ -411,10 +412,15 @@ impl CachedFileSystem {
 
     async fn cache_put(&self, key: &str, value: Bytes, affected_path: &str) -> bool {
         let started = Instant::now();
-        let result = self.runtime.put(key, value, PutOptions::default()).await;
+        let result = self.runtime.set(key, value, SetOptions::default()).await;
         self.metrics.put(started.elapsed());
         match result {
-            Ok(()) => true,
+            Ok(SetResult::Applied) => true,
+            Ok(SetResult::ConditionNotMet) => {
+                self.metrics.error();
+                self.mark_bypass(affected_path).await;
+                false
+            }
             Err(_) => {
                 self.metrics.error();
                 self.mark_bypass(affected_path).await;
@@ -425,10 +431,10 @@ impl CachedFileSystem {
 
     async fn cache_delete(&self, key: &str, affected_path: &str) {
         let started = Instant::now();
-        let result = self.runtime.delete(key).await;
+        let result = self.runtime.del(&[key.to_string()]).await;
         self.metrics.delete(started.elapsed());
         match result {
-            Ok(()) => self.metrics.invalidation(),
+            Ok(_) => self.metrics.invalidation(),
             Err(_) => {
                 self.metrics.error();
                 self.mark_bypass(affected_path).await;
@@ -545,39 +551,23 @@ impl CachedFileSystem {
     }
 
     async fn put_missing_generations(&self, missing: Vec<(String, u64)>) {
-        if missing.is_empty() {
-            return;
-        }
-
-        if missing.len() > 1 {
-            let entries = missing
-                .into_iter()
-                .map(|(key, value)| (key, Bytes::copy_from_slice(&value.to_be_bytes())))
-                .collect();
-            let started = Instant::now();
-            if self.runtime.batch_put(entries).await.is_err() {
-                self.metrics.error();
-            }
-            self.metrics.put(started.elapsed());
-            return;
-        }
-
-        for (key, value) in missing {
-            let started = Instant::now();
-            if self
-                .runtime
-                .put(
-                    &key,
-                    Bytes::copy_from_slice(&value.to_be_bytes()),
-                    PutOptions::default(),
-                )
-                .await
-                .is_err()
-            {
-                self.metrics.error();
-            }
-            self.metrics.put(started.elapsed());
-        }
+        stream::iter(missing)
+            .for_each_concurrent(GENERATION_PUT_CONCURRENCY, |(key, value)| async move {
+                let started = Instant::now();
+                let result = self
+                    .runtime
+                    .set(
+                        &key,
+                        Bytes::copy_from_slice(&value.to_be_bytes()),
+                        SetOptions::default(),
+                    )
+                    .await;
+                self.metrics.put(started.elapsed());
+                if !matches!(result, Ok(SetResult::Applied)) {
+                    self.metrics.error();
+                }
+            })
+            .await;
     }
 
     async fn generation_snapshots(&self, path: &str) -> CacheResult<Vec<GenerationSnapshot>> {

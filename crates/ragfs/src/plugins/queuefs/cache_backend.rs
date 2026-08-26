@@ -1,13 +1,13 @@
 use super::backend::{Message, StoredMessage};
-use super::redis_backend::{
-    heartbeat_key, instance_key_prefix, last_enqueue_time_from_pending_payloads, queue_names_key,
-    unix_secs, QueueKeys, ACK_SCRIPT, CLEAR_SCRIPT, CREATE_QUEUE_SCRIPT, DEQUEUE_SCRIPT,
-    ENQUEUE_SCRIPT, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TTL_SECS, LIST_UNACKED_SCRIPT, PEEK_SCRIPT,
-    RECOVER_STALE_SCRIPT, REMOVE_QUEUE_SCRIPT, STARTUP_RECOVERY_SWEEPS,
+use super::cache_protocol::{
+    heartbeat_key, instance_key_prefix, last_enqueue_time_from_pending_payloads, queue_key_prefix,
+    queue_names_key, unix_secs, QueueKeys, ACK_SCRIPT, CLEAR_SCRIPT, CREATE_QUEUE_SCRIPT,
+    DEQUEUE_SCRIPT, ENQUEUE_SCRIPT, HEARTBEAT_INTERVAL_SECS, HEARTBEAT_TTL_SECS,
+    LIST_UNACKED_SCRIPT, PEEK_SCRIPT, RECOVER_STALE_SCRIPT, REMOVE_QUEUE_SCRIPT,
+    STARTUP_RECOVERY_SWEEPS,
 };
 use crate::cache_runtime::{
-    AsyncCacheRuntime, CacheError, CacheRuntime, PutOptions, ScriptDefinition, ScriptRequest,
-    ScriptValue, SyncCacheRuntime,
+    CacheError, CacheRuntime, Expiration, ScriptDefinition, ScriptRequest, ScriptValue, SetOptions,
 };
 use crate::core::errors::{Error, Result};
 use bytes::Bytes;
@@ -18,11 +18,6 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
 
-const QUEUE_EXISTS_SCRIPT: &str = "return redis.call('SISMEMBER', KEYS[1], ARGV[1])";
-const LIST_QUEUES_SCRIPT: &str = "return redis.call('SMEMBERS', KEYS[1])";
-const SIZE_SCRIPT: &str = "return redis.call('LLEN', KEYS[1])";
-const LIST_PENDING_SCRIPT: &str = "return redis.call('LRANGE', KEYS[1], 0, -1)";
-
 const CREATE_QUEUE_ID: &str = "queuefs.create_queue.v1";
 const REMOVE_QUEUE_ID: &str = "queuefs.remove_queue.v1";
 const ENQUEUE_ID: &str = "queuefs.enqueue.v1";
@@ -32,10 +27,6 @@ const LIST_UNACKED_ID: &str = "queuefs.list_unacked.v1";
 const ACK_ID: &str = "queuefs.ack.v1";
 const CLEAR_ID: &str = "queuefs.clear.v1";
 const RECOVER_STALE_ID: &str = "queuefs.recover_stale.v1";
-const QUEUE_EXISTS_ID: &str = "queuefs.queue_exists.v1";
-const LIST_QUEUES_ID: &str = "queuefs.list_queues.v1";
-const SIZE_ID: &str = "queuefs.size.v1";
-const LIST_PENDING_ID: &str = "queuefs.list_pending.v1";
 
 const SCRIPT_DEFINITIONS: &[ScriptDefinition] = &[
     ScriptDefinition {
@@ -73,22 +64,6 @@ const SCRIPT_DEFINITIONS: &[ScriptDefinition] = &[
     ScriptDefinition {
         id: RECOVER_STALE_ID,
         redis_lua: RECOVER_STALE_SCRIPT,
-    },
-    ScriptDefinition {
-        id: QUEUE_EXISTS_ID,
-        redis_lua: QUEUE_EXISTS_SCRIPT,
-    },
-    ScriptDefinition {
-        id: LIST_QUEUES_ID,
-        redis_lua: LIST_QUEUES_SCRIPT,
-    },
-    ScriptDefinition {
-        id: SIZE_ID,
-        redis_lua: SIZE_SCRIPT,
-    },
-    ScriptDefinition {
-        id: LIST_PENDING_ID,
-        redis_lua: LIST_PENDING_SCRIPT,
     },
 ];
 
@@ -181,10 +156,7 @@ impl CacheQueueStorage {
                 "remove_queue",
                 REMOVE_QUEUE_ID,
                 vec![queue_names_key(&self.key_prefix)],
-                vec![
-                    bytes(name),
-                    bytes(super::redis_backend::queue_key_prefix(&self.key_prefix)),
-                ],
+                vec![bytes(name), bytes(queue_key_prefix(&self.key_prefix))],
             )
             .await?,
         )?;
@@ -195,15 +167,10 @@ impl CacheQueueStorage {
     }
 
     async fn queue_exists_result(&self, name: &str) -> Result<bool> {
-        boolean(
-            self.execute(
-                "queue_exists",
-                QUEUE_EXISTS_ID,
-                vec![queue_names_key(&self.key_prefix)],
-                vec![bytes(name)],
-            )
-            .await?,
-        )
+        self.runtime
+            .sismember(&queue_names_key(&self.key_prefix), name.as_bytes())
+            .await
+            .map_err(|error| cache_error("queue_exists", error))
     }
 
     pub(super) async fn queue_exists(&self, name: &str) -> bool {
@@ -218,16 +185,13 @@ impl CacheQueueStorage {
 
     pub(super) async fn list_queues(&self, prefix: &str) -> Vec<String> {
         let result = self
-            .execute(
-                "list_queues",
-                LIST_QUEUES_ID,
-                vec![queue_names_key(&self.key_prefix)],
-                Vec::new(),
-            )
+            .runtime
+            .smembers(&queue_names_key(&self.key_prefix))
             .await
-            .and_then(string_array);
+            .map_err(|error| cache_error("list_queues", error))
+            .and_then(bytes_array_to_strings);
         let mut queues = match result {
-            Ok(queues) => queues,
+            Ok(values) => values,
             Err(error) => {
                 tracing::error!(prefix, error = %error, "queuefs cache list_queues failed; returning an empty list");
                 return Vec::new();
@@ -323,10 +287,12 @@ impl CacheQueueStorage {
     pub(super) async fn size(&self, queue_name: &str) -> Result<usize> {
         self.require_queue(queue_name).await?;
         let keys = QueueKeys::new(&self.key_prefix, queue_name);
-        usize::try_from(integer(
-            self.execute("size", SIZE_ID, vec![keys.pending], Vec::new())
-                .await?,
-        )?)
+        usize::try_from(
+            self.runtime
+                .llen(&keys.pending)
+                .await
+                .map_err(|error| cache_error("size", error))?,
+        )
         .map_err(|_| Error::internal("redis size returned an invalid value"))
     }
 
@@ -380,15 +346,12 @@ impl CacheQueueStorage {
         self.require_queue(queue_name).await?;
         let keys = QueueKeys::new(&self.key_prefix, queue_name);
         let pending_key = keys.pending.clone();
-        let pending_ids = string_array(
-            self.execute(
-                "get_last_enqueue_time list pending",
-                LIST_PENDING_ID,
-                vec![pending_key],
-                Vec::new(),
-            )
-            .await?,
-        )?;
+        let pending_ids = self
+            .runtime
+            .lrange(&pending_key, 0, -1)
+            .await
+            .map_err(|error| cache_error("get_last_enqueue_time list pending", error))
+            .and_then(bytes_array_to_strings)?;
         if pending_ids.is_empty() {
             return Ok(UNIX_EPOCH);
         }
@@ -398,7 +361,7 @@ impl CacheQueueStorage {
             .collect::<Vec<_>>();
         let payloads = self
             .runtime
-            .batch_get(&message_keys)
+            .mget(&message_keys)
             .await
             .map_err(|error| cache_error("get_last_enqueue_time load payloads", error))?
             .into_iter()
@@ -438,9 +401,9 @@ impl Drop for CacheQueueStorage {
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let runtime = Arc::clone(&self.runtime);
             handle.spawn(async move {
-                let _ = runtime.delete(&key).await;
+                let _ = runtime.del(&[key]).await;
             });
-        } else if let Err(error) = self.runtime.sync_facade().delete(&key) {
+        } else if let Err(error) = self.runtime.sync_facade().del(&[key]) {
             tracing::warn!("queuefs cache heartbeat cleanup failed: {error}");
         }
     }
@@ -467,14 +430,16 @@ async fn run_heartbeat(runtime: Arc<CacheRuntime>, key: String, mut stop: watch:
 
 async fn refresh_heartbeat(runtime: &CacheRuntime, key: &str) -> Result<()> {
     runtime
-        .put(
+        .set(
             key,
             Bytes::from_static(b"1"),
-            PutOptions {
-                ttl: Some(Duration::from_secs(HEARTBEAT_TTL_SECS)),
+            SetOptions {
+                expiration: Some(Expiration::After(Duration::from_secs(HEARTBEAT_TTL_SECS))),
+                ..SetOptions::default()
             },
         )
         .await
+        .map(|_| ())
         .map_err(|error| cache_error("heartbeat", error))
 }
 
@@ -507,15 +472,11 @@ fn startup_recovery_delay_before_sweep(sweep_index: usize) -> Duration {
 }
 
 async fn recover_stale(runtime: &CacheRuntime, key_prefix: &str) -> Result<usize> {
-    let queues = execute_runtime(
-        runtime,
-        "recover_stale list queues",
-        LIST_QUEUES_ID,
-        vec![queue_names_key(key_prefix)],
-        Vec::new(),
-    )
-    .await
-    .and_then(string_array)?;
+    let queues = runtime
+        .smembers(&queue_names_key(key_prefix))
+        .await
+        .map_err(|error| cache_error("recover_stale list queues", error))
+        .and_then(bytes_array_to_strings)?;
     let mut recovered = 0;
     for queue in queues {
         let keys = QueueKeys::new(key_prefix, &queue);
@@ -590,6 +551,16 @@ fn string_array(value: ScriptValue) -> Result<Vec<String>> {
     }
 }
 
+fn bytes_array_to_strings(values: Vec<Bytes>) -> Result<Vec<String>> {
+    values
+        .into_iter()
+        .map(|value| {
+            String::from_utf8(value.to_vec())
+                .map_err(|error| Error::Serialization(format!("invalid queue payload: {error}")))
+        })
+        .collect()
+}
+
 fn invalid_result(expected: &str, value: ScriptValue) -> Error {
     Error::internal(format!(
         "cache script returned {value:?}, expected {expected}"
@@ -638,8 +609,8 @@ mod tests {
         let heartbeat = heartbeat_key("drop-test", &storage.instance_id);
         let sync = runtime.sync_facade();
 
-        assert!(sync.exists(&heartbeat).unwrap());
+        assert!(sync.get(&heartbeat).unwrap().is_some());
         drop(storage);
-        assert!(!sync.exists(&heartbeat).unwrap());
+        assert!(sync.get(&heartbeat).unwrap().is_none());
     }
 }

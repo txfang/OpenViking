@@ -24,6 +24,7 @@ class RagfsBindingConfig:
     """Single binding config object for both stack construction and backend mount setup."""
 
     agfs: Any
+    cache: Any | None = None
     root_key: bytes | None = None
     provider_type: int | None = None
     log: Dict[str, Any] | None = None
@@ -34,9 +35,57 @@ class RagfsBindingConfig:
 
     def to_binding_dict(self) -> Dict[str, Any]:
         """Convert the runtime config into the sectioned dict consumed by `RAGFSBindingClient`."""
-        cache_config = self.agfs.cache.model_dump(mode="json")
-        if getattr(getattr(self.agfs, "queuefs", None), "backend", None) == "cache":
-            cache_config["runtime_enabled"] = True
+        queuefs = getattr(self.agfs, "queuefs", None)
+        queue_backend = getattr(queuefs, "backend", None)
+        cachefs = getattr(self.agfs, "cachefs", None)
+        cachefs_backend = getattr(cachefs, "backend", "local")
+        uses_runtime = cachefs_backend == "cache" or queue_backend in {"cache", "redis"}
+        legacy_cache = getattr(self.agfs, "cache", None)
+        legacy_fields_set = set(getattr(legacy_cache, "model_fields_set", set()))
+
+        provider_explicit = False
+        redis_explicit: set[str] = set()
+        if self.cache is not None and uses_runtime:
+            if legacy_fields_set:
+                raise ValueError(
+                    "top-level cache config conflicts with deprecated storage.agfs.cache"
+                )
+            cache_config, redis_explicit = _build_provider_cache_config(
+                self.cache,
+                cachefs,
+                cachefs_backend == "cache",
+                uses_runtime,
+            )
+            provider_explicit = True
+        elif self.cache is not None:
+            cache_config = _disabled_cache_config(cachefs)
+        else:
+            cache_config = (
+                legacy_cache.model_dump(mode="json")
+                if legacy_cache is not None
+                else _disabled_cache_config(cachefs)
+            )
+            if cachefs_backend == "cache":
+                if legacy_cache is None or not legacy_fields_set:
+                    raise ValueError(
+                        "top-level cache config is required when cachefs backend=cache"
+                    )
+                cache_config["enabled"] = True
+            if uses_runtime:
+                cache_config["runtime_enabled"] = True
+            if legacy_cache is not None:
+                provider_explicit = "provider" in legacy_fields_set
+                legacy_redis = getattr(legacy_cache, "redis", None)
+                redis_explicit = set(getattr(legacy_redis, "model_fields_set", set()))
+
+        if queue_backend == "redis":
+            _merge_legacy_queuefs_redis_config(
+                cache_config,
+                provider=cache_config.get("provider", "redis"),
+                provider_explicit=provider_explicit,
+                redis_explicit=redis_explicit,
+                queuefs_model=queuefs,
+            )
         binding_config: Dict[str, Any] = {
             "cache": cache_config,
             "pathlock": self.agfs.pathlock.model_dump(mode="json"),
@@ -56,6 +105,101 @@ class RagfsBindingConfig:
             }
 
         return binding_config
+
+
+def _disabled_cache_config(cachefs_model: Any) -> Dict[str, Any]:
+    traversal_mode = getattr(cachefs_model, "traversal_mode", "backend")
+    return {
+        "enabled": False,
+        "runtime_enabled": False,
+        "provider": "redis",
+        "namespace": getattr(cachefs_model, "namespace", "openviking"),
+        "max_file_size_bytes": getattr(cachefs_model, "max_file_size_bytes", 1024 * 1024),
+        "traversal_mode": getattr(traversal_mode, "value", traversal_mode),
+        "bypass_prefixes": list(getattr(cachefs_model, "bypass_prefixes", [])),
+    }
+
+
+def _build_provider_cache_config(
+    provider_config: Any,
+    cachefs_model: Any,
+    cachefs_enabled: bool,
+    runtime_enabled: bool,
+) -> tuple[Dict[str, Any], set[str]]:
+    provider = provider_config.provider.strip()
+    params = dict(provider_config.params)
+    cache_config = _disabled_cache_config(cachefs_model)
+    cache_config.update(
+        {
+            "enabled": cachefs_enabled,
+            "runtime_enabled": runtime_enabled,
+            "provider": provider,
+        }
+    )
+    if provider == "redis":
+        from openviking_cli.utils.config.agfs_config import RedisCacheConfig
+
+        redis = RedisCacheConfig.model_validate(params)
+        cache_config["redis"] = redis.model_dump(mode="json")
+        return cache_config, set(redis.model_fields_set)
+    if provider == "dynamic":
+        cache_config["dynamic"] = params
+    return cache_config, set()
+
+
+def _merge_legacy_queuefs_redis_config(
+    cache_config: Dict[str, Any],
+    *,
+    provider: str,
+    provider_explicit: bool,
+    redis_explicit: set[str],
+    queuefs_model: Any,
+) -> None:
+    """Normalize the legacy QueueFS Redis connection into the shared Runtime config."""
+    if provider_explicit and provider != "redis":
+        raise ValueError("queuefs backend=redis conflicts with the global cache provider")
+
+    cache_config["provider"] = "redis"
+    target = cache_config.setdefault("redis", {})
+    explicit = redis_explicit
+    legacy_explicit = queuefs_model.redis.model_fields_set
+    legacy = queuefs_model.redis.model_dump(mode="json")
+    legacy["mode"] = "standalone" if legacy["mode"] == "singleton" else legacy["mode"]
+
+    nullable_strings = {
+        "master_name",
+        "username",
+        "password",
+        "sentinel_username",
+        "sentinel_password",
+    }
+    fields = (
+        "mode",
+        "endpoints",
+        "master_name",
+        "username",
+        "password",
+        "sentinel_username",
+        "sentinel_password",
+        "db",
+        "connect_timeout_ms",
+        "command_timeout_ms",
+        "tls_enabled",
+        "tls_insecure_skip_verify",
+    )
+    for field in fields:
+        value = legacy[field]
+        if field in nullable_strings and value is None:
+            value = "" if field != "master_name" else None
+        if field in explicit and field in legacy_explicit and target.get(field) != value:
+            raise ValueError(f"conflicting Redis setting: {field}")
+        if field in legacy_explicit or field not in explicit:
+            target[field] = value
+
+    if legacy.get("password") and target.get("password_env"):
+        raise ValueError("conflicting Redis setting: password")
+    if legacy.get("sentinel_password") and target.get("sentinel_password_env"):
+        raise ValueError("conflicting Redis setting: sentinel_password")
 
 
 def _run_coro_blocking(coro: Any) -> Any:
@@ -105,6 +249,7 @@ def build_runtime_ragfs_binding_config(config: Any) -> tuple[RagfsBindingConfig,
     agfs_config = _get_config_value(storage, "agfs") if storage is not None else None
     if agfs_config is None:
         raise ValueError("OpenViking config storage.agfs is required")
+    cache_config = _get_config_value(config, "cache")
 
     log_config = _get_config_value(config, "log")
     log_level = _get_config_value(log_config, "level", "INFO")
@@ -122,7 +267,11 @@ def build_runtime_ragfs_binding_config(config: Any) -> tuple[RagfsBindingConfig,
 
     encryptor = _run_coro_blocking(bootstrap_encryption(_dump_openviking_config(config)))
     if encryptor is None:
-        return RagfsBindingConfig(agfs=agfs_config, log=binding_log), None
+        return RagfsBindingConfig(
+            agfs=agfs_config,
+            cache=cache_config,
+            log=binding_log,
+        ), None
 
     root_key = _run_coro_blocking(encryptor.provider.get_root_key())
     if not isinstance(root_key, (bytes, bytearray)) or len(root_key) != 32:
@@ -131,6 +280,7 @@ def build_runtime_ragfs_binding_config(config: Any) -> tuple[RagfsBindingConfig,
     return (
         RagfsBindingConfig(
             agfs=agfs_config,
+            cache=cache_config,
             root_key=bytes(root_key),
             provider_type=encryptor.provider_type,
             log=binding_log,

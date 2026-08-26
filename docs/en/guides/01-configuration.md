@@ -1142,21 +1142,77 @@ Notes:
 
 See the [Multi-Write Storage Guide](./13-multi-write-storage.md) for more examples.
 
+##### Global Cache Provider and CacheFS Configuration
+
+The top-level `cache` section is a sibling of `storage`. Its public shape is Provider-neutral:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `provider` | str | Global Cache Provider. This release supports `redis` | required |
+| `params` | object | Provider-owned parameters; parsed as Redis connection settings when `provider=redis` | `{}` |
+
+`storage.agfs.cachefs` only controls CacheFS behavior:
+
+| Parameter | Type | Description | Default |
+|-----------|------|-------------|---------|
+| `backend` | str | `local` keeps the original filesystem path; `cache` enables the CacheFS wrapper | `local` |
+| `namespace` | str | CacheFS key namespace | `openviking` |
+| `max_file_size_bytes` | int | Maximum full-file object size admitted to cache | `1048576` |
+| `traversal_mode` | str | `backend` or `cached_traversal` | `backend` |
+| `bypass_prefixes` | array[str] | Path prefixes that bypass cache | `[]` |
+
+```json
+{
+  "cache": {
+    "provider": "redis",
+    "params": {
+      "mode": "sentinel",
+      "endpoints": [
+        "redis://sentinel-1:26379",
+        "redis://sentinel-2:26379"
+      ],
+      "master_name": "mymaster",
+      "password_env": "OPENVIKING_REDIS_PASSWORD",
+      "connect_timeout_ms": 1000,
+      "command_timeout_ms": 1000
+    }
+  },
+  "storage": {
+    "agfs": {
+      "cachefs": {
+        "backend": "cache",
+        "namespace": "production"
+      },
+      "queuefs": {
+        "backend": "cache",
+        "cache_key_prefix": "production"
+      }
+    }
+  }
+}
+```
+
+The canonical configuration has no global `cache.enabled`. CacheRuntime is initialized when CacheFS or QueueFS selects `backend=cache`. When all modules use local backends, `cache.params` is not parsed and no Provider connection is opened.
+
 ##### QueueFS Configuration
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `mode` | str | QueueFS namespace mode: `"shared"` uses `/queue`; `"worker"` isolates each worker under `/queue/worker-<index\|pid>` | `"shared"` |
-| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, or `"sqlite3"` | `"sqlite"` |
+| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, `"sqlite3"`, or `"cache"`; `"redis"` is a legacy compatibility value | `"sqlite"` |
 | `db_path` | str (optional) | SQLite database path for QueueFS when backend is `"sqlite"` or `"sqlite3"` | `null` |
 | `recover_stale_sec` | int | Recover `processing` queue messages older than this many seconds on startup. `0` means recover all stale processing messages | `0` |
 | `busy_timeout_ms` | int | SQLite busy timeout for QueueFS in milliseconds | `5000` |
+| `cache_key_prefix` | str | QueueFS key namespace when backend is `"cache"` | `"default"` |
 
 Notes:
 
 - QueueFS defaults to `sqlite` even if the main AGFS storage backend is `local`, `s3`, or `memory`.
 - `mode=shared` keeps the historical global queue namespace at `/queue`; `mode=worker` isolates each worker under `/queue/worker-<index|pid>`.
 - `db_path` is only used when QueueFS backend is `sqlite` or `sqlite3`.
+- `backend=cache` automatically binds the global `cache.provider + cache.params` configuration.
+- Redis Cluster slot routing, topology refresh, Sentinel discovery, and reconnects are handled by the Fred RedisProvider.
+- QueueFS cache keys use `{cache_key_prefix}:ov:*`; use different prefixes for deployments or tenants sharing one Redis cluster.
 - Redis backend runs three bounded `recover_stale` sweeps in a dedicated startup recovery thread at startup, 30 seconds, and 60 seconds to cover the heartbeat-expiry window after a container restart; it does not run long-lived periodic recovery.
 - If both `storage.agfs.queuefs.db_path` and legacy `storage.agfs.queue_db_path` are set, `storage.agfs.queuefs.db_path` wins.
 - If QueueFS backend is `memory`, any `db_path` or legacy `queue_db_path` is ignored.

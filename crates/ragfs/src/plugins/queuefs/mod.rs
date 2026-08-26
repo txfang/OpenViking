@@ -13,7 +13,8 @@
 mod backend;
 #[cfg(feature = "cache")]
 mod cache_backend;
-mod redis_backend;
+#[cfg(feature = "cache")]
+mod cache_protocol;
 
 use crate::core::{
     errors::{Error, Result},
@@ -25,8 +26,7 @@ use async_trait::async_trait;
 use backend::{MemoryBackend, Message, QueueBackend, SQLiteQueueBackend, SQLiteQueueOptions};
 #[cfg(feature = "cache")]
 use cache_backend::CacheQueueStorage;
-use redis_backend::RedisQueueBackend;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::sync::Arc;
 use std::time::SystemTime;
 use tokio::sync::Mutex;
@@ -80,7 +80,6 @@ struct QueueMessage {
 enum BackendKind {
     Memory,
     Sqlite,
-    Redis,
     #[cfg(feature = "cache")]
     Cache,
 }
@@ -90,178 +89,8 @@ struct ParsedBackendConfig {
     kind: BackendKind,
     sqlite_db_path: Option<String>,
     sqlite_options: SQLiteQueueOptions,
-    redis_options: Option<RedisQueueOptions>,
     #[cfg(feature = "cache")]
     cache_key_prefix: Option<String>,
-}
-
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq)]
-#[serde(rename_all = "lowercase")]
-enum RedisMode {
-    #[default]
-    Singleton,
-    Cluster,
-    Sentinel,
-}
-
-#[derive(Clone, Deserialize)]
-#[serde(default, deny_unknown_fields)]
-struct RedisQueueOptions {
-    mode: RedisMode,
-    endpoints: Vec<String>,
-    master_name: Option<String>,
-    username: Option<String>,
-    password: Option<String>,
-    sentinel_username: Option<String>,
-    sentinel_password: Option<String>,
-    db: i64,
-    connect_timeout_ms: u64,
-    command_timeout_ms: u64,
-    key_prefix: String,
-    tls_enabled: bool,
-    tls_insecure_skip_verify: bool,
-}
-
-impl std::fmt::Debug for RedisQueueOptions {
-    /// Format Redis settings without exposing the configured password.
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("RedisQueueOptions")
-            .field("mode", &self.mode)
-            .field("endpoints", &self.endpoints)
-            .field("master_name", &self.master_name)
-            .field("username", &self.username)
-            .field("password_configured", &self.password.is_some())
-            .field(
-                "sentinel_username_configured",
-                &self.sentinel_username.is_some(),
-            )
-            .field(
-                "sentinel_password_configured",
-                &self.sentinel_password.is_some(),
-            )
-            .field("db", &self.db)
-            .field("connect_timeout_ms", &self.connect_timeout_ms)
-            .field("command_timeout_ms", &self.command_timeout_ms)
-            .field("key_prefix", &self.key_prefix)
-            .field("tls_enabled", &self.tls_enabled)
-            .field(
-                "tls_insecure_skip_verify",
-                &self.tls_insecure_skip_verify,
-            )
-            .finish()
-    }
-}
-
-impl Default for RedisQueueOptions {
-    /// Return the default standalone Redis connection settings.
-    fn default() -> Self {
-        Self {
-            mode: RedisMode::Singleton,
-            endpoints: vec!["redis://127.0.0.1:6379".to_string()],
-            master_name: None,
-            username: None,
-            password: None,
-            sentinel_username: None,
-            sentinel_password: None,
-            db: 0,
-            connect_timeout_ms: 3_000,
-            command_timeout_ms: 3_000,
-            key_prefix: "default".to_string(),
-            tls_enabled: false,
-            tls_insecure_skip_verify: false,
-        }
-    }
-}
-
-impl RedisQueueOptions {
-    /// Validate Redis endpoint and timeout settings.
-    fn validate(&self) -> Result<()> {
-        if self.endpoints.is_empty() || self.endpoints.iter().any(|value| value.trim().is_empty()) {
-            return Err(Error::config(
-                "queuefs redis endpoints must not be empty".to_string(),
-            ));
-        }
-        for value in &self.endpoints {
-            if !value.starts_with("redis://") && !value.starts_with("rediss://") {
-                return Err(Error::config(
-                    "queuefs redis endpoints must use valid redis:// or rediss:// URLs".to_string(),
-                ));
-            }
-            let info = redis::IntoConnectionInfo::into_connection_info(value.as_str()).map_err(|_| {
-                Error::config("queuefs redis endpoints must use valid redis:// or rediss:// URLs".to_string())
-            })?;
-            let endpoint = value
-                .split_once("://")
-                .map(|(_, endpoint)| endpoint)
-                .unwrap_or_default();
-            let options_start = endpoint
-                .find(|character| matches!(character, '/' | '?' | '#'))
-                .unwrap_or(endpoint.len());
-            if endpoint[..options_start].contains('@')
-                || !matches!(&endpoint[options_start..], "" | "/")
-            {
-                return Err(Error::config(
-                    "queuefs redis endpoints must not include credentials, database paths, query parameters, or fragments; use dedicated redis fields".to_string(),
-                ));
-            }
-            if matches!(
-                info.addr(),
-                redis::ConnectionAddr::Tcp(_, 0) | redis::ConnectionAddr::TcpTls { port: 0, .. }
-            ) {
-                return Err(Error::config("queuefs redis endpoint port is invalid".to_string()));
-            }
-        }
-        if self.mode == RedisMode::Singleton && self.endpoints.len() != 1 {
-            return Err(Error::config(
-                "queuefs redis singleton mode requires exactly one endpoint".to_string(),
-            ));
-        }
-        if self.mode == RedisMode::Cluster && self.db != 0 {
-            return Err(Error::config(
-                "queuefs redis cluster mode requires db=0".to_string(),
-            ));
-        }
-        if self.mode == RedisMode::Sentinel
-            && self
-                .master_name
-                .as_deref()
-                .is_none_or(|value| value.trim().is_empty())
-        {
-            return Err(Error::config(
-                "queuefs redis sentinel mode requires master_name".to_string(),
-            ));
-        }
-        if self.db < 0 {
-            return Err(Error::config("queuefs redis db must be >= 0".to_string()));
-        }
-        if self.connect_timeout_ms == 0 {
-            return Err(Error::config(
-                "queuefs redis connect_timeout_ms must be > 0".to_string(),
-            ));
-        }
-        if self.command_timeout_ms == 0 {
-            return Err(Error::config(
-                "queuefs redis command_timeout_ms must be > 0".to_string(),
-            ));
-        }
-        if self.key_prefix.trim().is_empty() {
-            return Err(Error::config(
-                "queuefs redis key_prefix must not be empty".to_string(),
-            ));
-        }
-        if self.key_prefix.contains(['{', '}']) {
-            return Err(Error::config(
-                "queuefs redis key_prefix must not contain '{' or '}'".to_string(),
-            ));
-        }
-        if self.tls_insecure_skip_verify && !self.tls_enabled {
-            return Err(Error::config(
-                "queuefs redis tls_insecure_skip_verify requires tls_enabled=true".to_string(),
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Parsed path information
@@ -813,9 +642,7 @@ impl QueueFSPlugin {
     }
 
     #[cfg(feature = "cache")]
-    pub(crate) fn with_cache_runtime(
-        runtime: Arc<crate::cache_runtime::CacheRuntime>,
-    ) -> Self {
+    pub(crate) fn with_cache_runtime(runtime: Arc<crate::cache_runtime::CacheRuntime>) -> Self {
         let mut plugin = Self::new();
         plugin.cache_runtime = Some(runtime);
         plugin
@@ -834,7 +661,7 @@ impl QueueFSPlugin {
         #[cfg(feature = "cache")]
         let valid_backends = ["memory", "sqlite", "sqlite3", "redis", "cache"];
         #[cfg(not(feature = "cache"))]
-        let valid_backends = ["memory", "sqlite", "sqlite3", "redis"];
+        let valid_backends = ["memory", "sqlite", "sqlite3"];
         if !valid_backends.contains(&backend_name) {
             return Err(Error::config(format!(
                 "unsupported queue backend: {} (valid: {})",
@@ -846,9 +673,8 @@ impl QueueFSPlugin {
         let kind = match backend_name {
             "memory" => BackendKind::Memory,
             "sqlite" | "sqlite3" => BackendKind::Sqlite,
-            "redis" => BackendKind::Redis,
             #[cfg(feature = "cache")]
-            "cache" => BackendKind::Cache,
+            "cache" | "redis" => BackendKind::Cache,
             _ => {
                 return Err(Error::config(format!(
                     "unsupported queue backend: {}",
@@ -875,7 +701,7 @@ impl QueueFSPlugin {
         }
 
         let sqlite_db_path = match kind {
-            BackendKind::Memory | BackendKind::Redis => None,
+            BackendKind::Memory => None,
             #[cfg(feature = "cache")]
             BackendKind::Cache => None,
             BackendKind::Sqlite => {
@@ -889,35 +715,16 @@ impl QueueFSPlugin {
                 Some(db_path.to_string())
             }
         };
-        let redis_options = match kind {
-            BackendKind::Redis => {
-                let options = match config.params.get("redis") {
-                    Some(crate::core::types::ConfigValue::Json(value)) => {
-                        serde_json::from_value(value.clone()).map_err(|error| {
-                            Error::config(format!("invalid queuefs redis config: {error}"))
-                        })?
-                    }
-                    Some(_) => {
-                        return Err(Error::config(
-                            "queuefs redis config must be a JSON object".to_string(),
-                        ))
-                    }
-                    None => RedisQueueOptions::default(),
-                };
-                options.validate()?;
-                Some(options)
-            }
-            BackendKind::Memory | BackendKind::Sqlite => None,
-            #[cfg(feature = "cache")]
-            BackendKind::Cache => None,
-        };
-
         #[cfg(feature = "cache")]
         let cache_key_prefix = match kind {
             BackendKind::Cache => {
-                let prefix = Self::get_string_param(config, "cache_key_prefix")
-                    .unwrap_or("default")
-                    .to_string();
+                let prefix = if backend_name == "redis" {
+                    legacy_redis_key_prefix(config)?
+                } else {
+                    Self::get_string_param(config, "cache_key_prefix")
+                        .unwrap_or("default")
+                        .to_string()
+                };
                 if prefix.trim().is_empty() || prefix.contains(['{', '}']) {
                     return Err(Error::config(
                         "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
@@ -936,10 +743,33 @@ impl QueueFSPlugin {
                 recover_stale_sec,
                 busy_timeout_ms,
             },
-            redis_options,
             #[cfg(feature = "cache")]
             cache_key_prefix,
         })
+    }
+}
+
+#[cfg(feature = "cache")]
+fn legacy_redis_key_prefix(config: &PluginConfig) -> Result<String> {
+    let redis = match config.params.get("redis") {
+        Some(crate::core::types::ConfigValue::Json(value)) => {
+            value.as_object().ok_or_else(|| {
+                Error::config("queuefs redis config must be a JSON object".to_string())
+            })?
+        }
+        Some(_) => {
+            return Err(Error::config(
+                "queuefs redis config must be a JSON object".to_string(),
+            ))
+        }
+        None => return Ok("default".to_string()),
+    };
+    match redis.get("key_prefix") {
+        Some(serde_json::Value::String(value)) => Ok(value.clone()),
+        Some(_) => Err(Error::config(
+            "queuefs redis key_prefix must be a string".to_string(),
+        )),
+        None => Ok("default".to_string()),
     }
 }
 
@@ -1018,13 +848,6 @@ impl ServicePlugin for QueueFSPlugin {
                     .expect("sqlite db_path is validated"),
                 parsed.sqlite_options,
             )?),
-            BackendKind::Redis => {
-                Box::new(RedisQueueBackend::open(
-                    parsed
-                        .redis_options
-                        .expect("redis options are validated for redis backend"),
-                )?)
-            }
             #[cfg(feature = "cache")]
             BackendKind::Cache => {
                 return Ok(Box::new(
@@ -1063,6 +886,7 @@ mod tests {
     }
 
     /// Build a QueueFS plugin config containing a nested Redis object.
+    #[cfg(feature = "cache")]
     fn redis_plugin_config(redis: serde_json::Value) -> PluginConfig {
         let mut params = std::collections::HashMap::new();
         params.insert(
@@ -1299,13 +1123,14 @@ mod tests {
         assert_eq!(plugin.name(), "queuefs");
         assert!(!plugin.readme().is_empty());
         let config_params = plugin.config_params();
-        assert_eq!(config_params.len(), 5 + usize::from(cfg!(feature = "cache")));
-        #[cfg(feature = "cache")]
-        assert!(
-            config_params
-                .iter()
-                .any(|parameter| parameter.name == "cache_key_prefix")
+        assert_eq!(
+            config_params.len(),
+            5 + usize::from(cfg!(feature = "cache"))
         );
+        #[cfg(feature = "cache")]
+        assert!(config_params
+            .iter()
+            .any(|parameter| parameter.name == "cache_key_prefix"));
 
         let config =
             PluginConfig::single_backend("queuefs", "/queue", std::collections::HashMap::new());
@@ -1322,190 +1147,30 @@ mod tests {
         assert_eq!(msg.data, "test");
     }
 
+    #[cfg(feature = "cache")]
     #[test]
-    fn test_parse_redis_backend_config() {
-        let parsed = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
-                "mode": "singleton",
-                "endpoints": ["redis://127.0.0.1:6379"],
-                "master_name": null,
-                "username": "queue-user",
-                "password": "secret",
-                "sentinel_username": null,
-                "sentinel_password": null,
-                "db": 2,
-                "connect_timeout_ms": 1500,
-                "command_timeout_ms": 2500,
-                "key_prefix": "tenant-a",
-                "tls_enabled": false,
-                "tls_insecure_skip_verify": false
-            }),
-        ))
+    fn legacy_redis_backend_is_normalized_to_cache_runtime() {
+        let parsed = QueueFSPlugin::parse_backend_config(&redis_plugin_config(serde_json::json!({
+            "mode": "singleton",
+            "endpoints": ["redis://127.0.0.1:6379"],
+            "key_prefix": "tenant-a"
+        })))
         .unwrap();
 
-        assert!(matches!(parsed.kind, BackendKind::Redis));
-        let options = parsed.redis_options.unwrap();
-        assert_eq!(options.endpoints, vec!["redis://127.0.0.1:6379"]);
-        assert_eq!(options.username.as_deref(), Some("queue-user"));
-        assert_eq!(options.password.as_deref(), Some("secret"));
-        assert_eq!(options.db, 2);
-        assert_eq!(options.connect_timeout_ms, 1500);
-        assert_eq!(options.command_timeout_ms, 2500);
-        assert_eq!(options.key_prefix, "tenant-a");
+        assert!(matches!(parsed.kind, BackendKind::Cache));
+        assert_eq!(parsed.cache_key_prefix.as_deref(), Some("tenant-a"));
     }
 
+    #[cfg(feature = "cache")]
     #[test]
-    /// Accept valid Cluster and Sentinel topology configurations.
-    fn test_parse_redis_backend_config_accepts_high_availability_modes() {
-        let cluster = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
-                "mode": "cluster",
-                "endpoints": ["redis://cluster-1:6379", "redis://cluster-2:6379"],
-                "db": 0
-            }),
-        ));
-        assert!(cluster.is_ok());
+    fn legacy_redis_backend_rejects_invalid_namespace() {
+        let error = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
+            serde_json::json!({"key_prefix": "invalid{tag}"}),
+        ))
+        .unwrap_err()
+        .to_string();
 
-        let sentinel = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({
-                "mode": "sentinel",
-                "endpoints": ["redis://sentinel-1:26379", "redis://sentinel-2:26379"],
-                "master_name": "mymaster"
-            }),
-        ));
-        assert!(sentinel.is_ok());
-    }
-
-    #[test]
-    /// Reject topology settings that violate the selected Redis mode.
-    fn test_parse_redis_backend_config_rejects_invalid_mode_settings() {
-        let cases = [
-            (serde_json::json!({"mode": "invalid"}), "invalid"),
-            (
-                serde_json::json!({
-                    "mode": "singleton",
-                    "endpoints": ["redis://redis-1:6379", "redis://redis-2:6379"]
-                }),
-                "singleton",
-            ),
-            (
-                serde_json::json!({"mode": "cluster", "endpoints": []}),
-                "endpoints",
-            ),
-            (serde_json::json!({"mode": "cluster", "db": 1}), "db"),
-            (
-                serde_json::json!({
-                    "mode": "sentinel",
-                    "endpoints": [],
-                    "master_name": "mymaster"
-                }),
-                "endpoints",
-            ),
-            (
-                serde_json::json!({"mode": "sentinel", "master_name": ""}),
-                "master_name",
-            ),
-            (
-                serde_json::json!({"key_prefix": "invalid{tag}"}),
-                "key_prefix",
-            ),
-        ];
-
-        for (redis, expected) in cases {
-            let error = QueueFSPlugin::parse_backend_config(&redis_plugin_config(redis))
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(expected),
-                "expected {expected:?} in {error:?}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_parse_redis_backend_config_rejects_empty_endpoints() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "backend".to_string(),
-            crate::core::types::ConfigValue::String("redis".to_string()),
-        );
-        params.insert(
-            "redis".to_string(),
-            crate::core::types::ConfigValue::Json(serde_json::json!({
-                "endpoints": []
-            })),
-        );
-        let config = PluginConfig::single_backend("queuefs", "/queue", params);
-
-        assert!(QueueFSPlugin::parse_backend_config(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("endpoints"));
-    }
-
-    #[test]
-    fn test_parse_redis_backend_config_rejects_invalid_endpoint() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "backend".to_string(),
-            crate::core::types::ConfigValue::String("redis".to_string()),
-        );
-        params.insert(
-            "redis".to_string(),
-            crate::core::types::ConfigValue::Json(serde_json::json!({
-                "endpoints": ["http://127.0.0.1:6379"]
-            })),
-        );
-        let config = PluginConfig::single_backend("queuefs", "/queue", params);
-
-        assert!(QueueFSPlugin::parse_backend_config(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("redis:// or rediss://"));
-    }
-
-    #[test]
-    /// Reject an empty Redis namespace prefix.
-    fn test_parse_redis_backend_config_rejects_empty_key_prefix() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "backend".to_string(),
-            crate::core::types::ConfigValue::String("redis".to_string()),
-        );
-        params.insert(
-            "redis".to_string(),
-            crate::core::types::ConfigValue::Json(serde_json::json!({
-                "key_prefix": ""
-            })),
-        );
-        let config = PluginConfig::single_backend("queuefs", "/queue", params);
-
-        assert!(QueueFSPlugin::parse_backend_config(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("key_prefix"));
-    }
-
-    #[test]
-    /// Reject the removed Redis connection pool setting.
-    fn test_parse_redis_backend_config_rejects_removed_pool_max_size() {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "backend".to_string(),
-            crate::core::types::ConfigValue::String("redis".to_string()),
-        );
-        params.insert(
-            "redis".to_string(),
-            crate::core::types::ConfigValue::Json(serde_json::json!({
-                "pool_max_size": 16
-            })),
-        );
-        let config = PluginConfig::single_backend("queuefs", "/queue", params);
-
-        assert!(QueueFSPlugin::parse_backend_config(&config)
-            .unwrap_err()
-            .to_string()
-            .contains("pool_max_size"));
+        assert!(error.contains("key_prefix"));
     }
 
     #[tokio::test]
@@ -1579,16 +1244,15 @@ mod tests {
         let Ok(endpoint) = std::env::var("QUEUEFS_REDIS_TEST_URL") else {
             return;
         };
-        let runtime = crate::cache_runtime::CacheRuntime::redis(
-            crate::cache_runtime::RedisProviderConfig {
+        let runtime =
+            crate::cache_runtime::CacheRuntime::redis(crate::cache_runtime::RedisProviderConfig {
                 endpoints: vec![endpoint],
                 key_prefix: String::new(),
                 command_timeout_ms: 1_000,
                 ..crate::cache_runtime::RedisProviderConfig::default()
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         let queue_prefix = format!("queuefs-runtime-test-{}", uuid::Uuid::new_v4());
         let fs = QueueFileSystem::with_cache_runtime(runtime.clone(), queue_prefix)
             .await
@@ -1602,14 +1266,9 @@ mod tests {
         let dequeued: TestQueueMessage =
             serde_json::from_slice(&fs.read("/Semantic/dequeue", 0, 0).await.unwrap()).unwrap();
         assert_eq!(dequeued.data, "payload");
-        fs.write(
-            "/Semantic/ack",
-            dequeued.id.as_bytes(),
-            0,
-            WriteFlag::None,
-        )
-        .await
-        .unwrap();
+        fs.write("/Semantic/ack", dequeued.id.as_bytes(), 0, WriteFlag::None)
+            .await
+            .unwrap();
         assert_eq!(fs.read("/Semantic/size", 0, 0).await.unwrap(), b"0");
         fs.remove_all("/Semantic").await.unwrap();
         drop(fs);
@@ -1622,16 +1281,15 @@ mod tests {
         let Ok(endpoint) = std::env::var("QUEUEFS_REDIS_TEST_URL") else {
             return;
         };
-        let runtime = crate::cache_runtime::CacheRuntime::redis(
-            crate::cache_runtime::RedisProviderConfig {
+        let runtime =
+            crate::cache_runtime::CacheRuntime::redis(crate::cache_runtime::RedisProviderConfig {
                 endpoints: vec![endpoint],
                 key_prefix: String::new(),
                 command_timeout_ms: 1_000,
                 ..crate::cache_runtime::RedisProviderConfig::default()
-            },
-        )
-        .await
-        .unwrap();
+            })
+            .await
+            .unwrap();
         let fs = QueueFileSystem::with_cache_runtime(
             runtime.clone(),
             format!("queuefs-runtime-failure-{}", uuid::Uuid::new_v4()),
