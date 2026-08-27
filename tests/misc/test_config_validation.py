@@ -352,7 +352,7 @@ def test_queuefs_cache_uses_top_level_provider_without_enabling_cachefs():
     assert binding["cache"]["redis"]["endpoints"] == ["redis://redis:6379"]
 
 
-def test_top_level_cache_params_preserve_cluster_replica_read_config():
+def test_top_level_cache_params_consume_removed_replica_read_config():
     config = OpenVikingConfig.model_validate(
         {
             "cache": {
@@ -377,7 +377,7 @@ def test_top_level_cache_params_preserve_cluster_replica_read_config():
     ).to_binding_dict()
 
     assert binding["cache"]["redis"]["mode"] == "cluster"
-    assert binding["cache"]["redis"]["read_from_replica"] is True
+    assert "read_from_replica" not in binding["cache"]["redis"]
 
 
 def test_cache_backend_requires_top_level_cache_config():
@@ -490,6 +490,28 @@ def test_openviking_config_migrates_legacy_nested_cache_to_canonical_shape():
     assert "cache" not in config.model_dump(mode="json")["storage"]["agfs"]
 
 
+def test_legacy_cache_key_prefix_is_migrated_into_cachefs_namespace():
+    config = OpenVikingConfig.from_dict(
+        {
+            "storage": {
+                "agfs": {
+                    "cache": {
+                        "enabled": True,
+                        "provider": "redis",
+                        "namespace": "openviking",
+                        "redis": {"key_prefix": "ragfs-cache"},
+                    }
+                }
+            }
+        }
+    )
+
+    binding = RagfsBindingConfig(config.storage.agfs, cache=config.cache).to_binding_dict()
+
+    assert config.storage.agfs.cachefs.namespace == "ragfs-cache:openviking"
+    assert binding["cache"]["redis"]["key_prefix"] == ""
+
+
 def test_openviking_config_migrates_legacy_queuefs_redis_to_canonical_shape():
     config = OpenVikingConfig.from_dict(
         {
@@ -512,6 +534,61 @@ def test_openviking_config_migrates_legacy_queuefs_redis_to_canonical_shape():
     assert config.cache.params["mode"] == "standalone"
     assert config.storage.agfs.queuefs.backend == "cache"
     assert config.storage.agfs.queuefs.cache_key_prefix == "legacy-queue"
+
+
+def test_legacy_queuefs_redis_preserves_historical_timeout_defaults():
+    config = OpenVikingConfig.from_dict(
+        {"storage": {"agfs": {"queuefs": {"backend": "redis"}}}}
+    )
+
+    binding = RagfsBindingConfig(config.storage.agfs, cache=config.cache).to_binding_dict()
+
+    assert binding["cache"]["redis"]["connect_timeout_ms"] == 3000
+    assert binding["cache"]["redis"]["command_timeout_ms"] == 3000
+
+
+def test_legacy_tls_flag_is_migrated_to_rediss_scheme():
+    config = OpenVikingConfig.from_dict(
+        {
+            "storage": {
+                "agfs": {
+                    "queuefs": {
+                        "backend": "redis",
+                        "redis": {
+                            "endpoints": ["redis://redis.example.com:6380"],
+                            "tls_enabled": True,
+                        },
+                    }
+                }
+            }
+        }
+    )
+
+    binding = RagfsBindingConfig(config.storage.agfs, cache=config.cache).to_binding_dict()
+
+    assert binding["cache"]["redis"]["endpoints"] == [
+        "rediss://redis.example.com:6380"
+    ]
+    assert "tls_enabled" not in binding["cache"]["redis"]
+
+
+def test_rediss_scheme_enables_tls_without_boolean_flag():
+    config = OpenVikingConfig.model_validate(
+        {
+            "cache": {
+                "provider": "redis",
+                "params": {"endpoints": ["rediss://redis.example.com:6380"]},
+            },
+            "storage": {"agfs": {"cachefs": {"backend": "cache"}}},
+        }
+    )
+
+    binding = RagfsBindingConfig(config.storage.agfs, cache=config.cache).to_binding_dict()
+
+    assert binding["cache"]["redis"]["endpoints"] == [
+        "rediss://redis.example.com:6380"
+    ]
+    assert "tls_enabled" not in binding["cache"]["redis"]
 
 
 def test_binding_config_migrates_legacy_queuefs_redis_to_cache_runtime():
@@ -787,7 +864,6 @@ def test_generate_plugin_config_forwards_queuefs_redis_config():
         "connect_timeout_ms": 1500,
         "command_timeout_ms": 2500,
         "key_prefix": "tenant-b",
-        "tls_enabled": True,
         "tls_insecure_skip_verify": False,
     }
     config = AGFSConfig(

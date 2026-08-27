@@ -299,8 +299,6 @@ struct RedisCacheConfig {
     command_timeout_ms: u64,
     key_prefix: String,
     default_ttl_seconds: u64,
-    read_from_replica: bool,
-    tls_enabled: bool,
     tls_insecure_skip_verify: bool,
 }
 
@@ -347,8 +345,6 @@ impl Default for RedisCacheConfig {
             command_timeout_ms: 20,
             key_prefix: String::new(),
             default_ttl_seconds: 3_600,
-            read_from_replica: false,
-            tls_enabled: false,
             tls_insecure_skip_verify: false,
         }
     }
@@ -376,8 +372,6 @@ impl RagfsCacheConfig {
                 command_timeout_ms: self.redis.command_timeout_ms,
                 key_prefix: self.redis.key_prefix.clone(),
                 default_ttl_seconds: self.redis.default_ttl_seconds,
-                read_from_replica: self.redis.read_from_replica,
-                tls_enabled: self.redis.tls_enabled,
                 tls_insecure_skip_verify: self.redis.tls_insecure_skip_verify,
             }),
             CacheProviderKind::Dynamic => {
@@ -483,17 +477,26 @@ fn merge_legacy_queuefs_redis_config(
         config.redis.mode = legacy_mode;
     }
 
-    let legacy_endpoints = string_array_field_or_default(
+    let legacy_tls_enabled = bool_field(legacy_redis, "tls_enabled", false)?;
+    let mut legacy_endpoints = string_array_field_or_default(
         legacy_redis,
         "endpoints",
         &["redis://127.0.0.1:6379".to_string()],
     )?;
-    if merge_legacy_field(
-        "endpoints",
-        cache_redis,
-        legacy_redis,
-        config.redis.endpoints == legacy_endpoints,
-    )? {
+    if legacy_tls_enabled {
+        legacy_endpoints = enable_tls_for_endpoints(legacy_endpoints);
+    }
+    let global_transport_explicit = cache_redis
+        .is_some_and(|redis| redis.contains_key("endpoints") || redis.contains_key("tls_enabled"));
+    let legacy_transport_explicit =
+        legacy_redis.contains_key("endpoints") || legacy_redis.contains_key("tls_enabled");
+    if global_transport_explicit
+        && legacy_transport_explicit
+        && config.redis.endpoints != legacy_endpoints
+    {
+        return Err("conflicting Redis setting: endpoints".to_string());
+    }
+    if legacy_transport_explicit || !global_transport_explicit {
         config.redis.endpoints = legacy_endpoints;
     }
 
@@ -557,21 +560,15 @@ fn merge_legacy_queuefs_redis_config(
     merge_u64!(connect_timeout_ms, 3_000);
     merge_u64!(command_timeout_ms, 3_000);
 
-    macro_rules! merge_bool {
-        ($field:ident) => {{
-            let value = bool_field(legacy_redis, stringify!($field), false)?;
-            if merge_legacy_field(
-                stringify!($field),
-                cache_redis,
-                legacy_redis,
-                config.redis.$field == value,
-            )? {
-                config.redis.$field = value;
-            }
-        }};
+    let tls_insecure_skip_verify = bool_field(legacy_redis, "tls_insecure_skip_verify", false)?;
+    if merge_legacy_field(
+        "tls_insecure_skip_verify",
+        cache_redis,
+        legacy_redis,
+        config.redis.tls_insecure_skip_verify == tls_insecure_skip_verify,
+    )? {
+        config.redis.tls_insecure_skip_verify = tls_insecure_skip_verify;
     }
-    merge_bool!(tls_enabled);
-    merge_bool!(tls_insecure_skip_verify);
 
     if !config.redis.password.is_empty() && !config.redis.password_env.is_empty() {
         return Err("conflicting Redis setting: password".to_string());
@@ -660,9 +657,10 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
             "default_ttl_seconds",
             config.redis.default_ttl_seconds,
         )?;
-        config.redis.read_from_replica =
-            bool_field(redis, "read_from_replica", config.redis.read_from_replica)?;
-        config.redis.tls_enabled = bool_field(redis, "tls_enabled", config.redis.tls_enabled)?;
+        let _ = bool_field(redis, "read_from_replica", false)?;
+        if bool_field(redis, "tls_enabled", false)? {
+            config.redis.endpoints = enable_tls_for_endpoints(config.redis.endpoints);
+        }
         config.redis.tls_insecure_skip_verify = bool_field(
             redis,
             "tls_insecure_skip_verify",
@@ -680,8 +678,26 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
     }
+    if config.enabled && !config.redis.key_prefix.is_empty() {
+        let key_prefix = config.redis.key_prefix.trim_matches(':');
+        if !key_prefix.is_empty() {
+            config.namespace = format!("{key_prefix}:{}", config.namespace);
+        }
+        config.redis.key_prefix.clear();
+    }
     validate_cache_runtime_config(&config)?;
     Ok(config)
+}
+
+fn enable_tls_for_endpoints(endpoints: Vec<String>) -> Vec<String> {
+    endpoints
+        .into_iter()
+        .map(|endpoint| {
+            endpoint
+                .strip_prefix("redis://")
+                .map_or(endpoint.clone(), |rest| format!("rediss://{rest}"))
+        })
+        .collect()
 }
 
 fn validate_cache_runtime_config(config: &RagfsCacheConfig) -> Result<(), String> {
@@ -3283,7 +3299,7 @@ mod tests {
                                 "command_timeout_ms": 20,
                                 "key_prefix": "",
                                 "default_ttl_seconds": 3600,
-                                "read_from_replica": false
+                                "read_from_replica": true
                             }
                         }
                     }
@@ -3303,7 +3319,105 @@ mod tests {
         assert_eq!(cache_config.redis.command_timeout_ms, 20);
         assert!(cache_config.redis.key_prefix.is_empty());
         assert_eq!(cache_config.redis.default_ttl_seconds, 3600);
-        assert!(!cache_config.redis.read_from_replica);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_cache_key_prefix_is_folded_into_the_namespace() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-legacy-cache-prefix-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "cache": {
+                            "enabled": true,
+                            "provider": "redis",
+                            "namespace": "openviking",
+                            "redis": {"key_prefix": "ragfs-cache"}
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(cache_config.namespace, "ragfs-cache:openviking");
+        assert!(cache_config.redis.key_prefix.is_empty());
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_tls_flag_is_converted_to_rediss_endpoints() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-legacy-cache-tls-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "cache": {
+                            "enabled": true,
+                            "provider": "redis",
+                            "redis": {
+                                "endpoints": ["redis://redis.example.com:6380"],
+                                "tls_enabled": true
+                            }
+                        }
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            cache_config.redis.endpoints,
+            vec!["rediss://redis.example.com:6380"]
+        );
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn legacy_queue_defaults_do_not_override_global_tls_transport() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-legacy-shared-tls-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "storage": {
+                    "agfs": {
+                        "cache": {
+                            "enabled": true,
+                            "provider": "redis",
+                            "redis": {"tls_enabled": true}
+                        },
+                        "queuefs": {"backend": "redis"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert_eq!(
+            cache_config.redis.endpoints,
+            vec!["rediss://127.0.0.1:6379"]
+        );
 
         fs::remove_file(path).unwrap();
     }

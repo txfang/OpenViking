@@ -30,8 +30,7 @@ Configure the global top-level `cache` Provider, then select `backend=cache` und
       "pool_size": 32,
       "connect_timeout_ms": 1000,
       "command_timeout_ms": 1000,
-      "default_ttl_seconds": 3600,
-      "read_from_replica": false
+      "default_ttl_seconds": 3600
     }
   },
   "storage": {
@@ -109,7 +108,7 @@ Redis configuration:
 | Option | Default | Description |
 |--------|---------|-------------|
 | `mode` | `"standalone"` | Redis deployment mode |
-| `endpoints` | `["redis://127.0.0.1:6379"]` | Redis connection URLs |
+| `endpoints` | `["redis://127.0.0.1:6379"]` | Redis connection URLs; use `redis://` for plaintext or `rediss://` for TLS |
 | `username` | `""` | Redis ACL username |
 | `password_env` | `""` | Environment variable that stores the Redis password |
 | `pool_size` | `32` | Command concurrency |
@@ -117,7 +116,9 @@ Redis configuration:
 | `command_timeout_ms` | `20` | Command timeout |
 | `key_prefix` | `""` | Reserved compatibility field; the unified Runtime requires an empty value |
 | `default_ttl_seconds` | `3600` | Default TTL; `0` means no TTL |
-| `read_from_replica` | `false` | Supported only in Cluster mode; enable according to CacheFS consistency requirements |
+| `tls_insecure_skip_verify` | `false` | Skip certificate verification for `rediss://`; intended only for controlled test environments |
+
+All Redis reads are sent to the primary node so QueueFS does not observe stale queue state. CacheRuntime relies on Redis transport security when required and does not add a separate application-layer value encryption format.
 
 Future DynamicProvider configuration shape:
 

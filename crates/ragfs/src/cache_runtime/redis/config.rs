@@ -48,11 +48,7 @@ pub struct RedisProviderConfig {
     pub key_prefix: String,
     /// Default TTL in seconds; zero disables expiration.
     pub default_ttl_seconds: u64,
-    /// Whether reads may use replicas.
-    pub read_from_replica: bool,
-    /// Enable TLS for Redis and Sentinel connections.
-    pub tls_enabled: bool,
-    /// Disable certificate verification. Requires `tls_enabled=true`.
+    /// Disable certificate verification for `rediss://` endpoints.
     pub tls_insecure_skip_verify: bool,
 }
 
@@ -74,8 +70,6 @@ impl Default for RedisProviderConfig {
             command_timeout_ms: 20,
             key_prefix: String::new(),
             default_ttl_seconds: 3_600,
-            read_from_replica: false,
-            tls_enabled: false,
             tls_insecure_skip_verify: false,
         }
     }
@@ -106,9 +100,7 @@ impl RedisProviderConfig {
                 "Redis endpoints must not be empty".into(),
             ));
         }
-        for endpoint in &self.endpoints {
-            validate_endpoint(endpoint)?;
-        }
+        let uses_tls = self.uses_tls()?;
         if mode == RedisDeploymentMode::Standalone && self.endpoints.len() != 1 {
             return Err(CacheError::InvalidArgument(
                 "Redis standalone mode requires exactly one endpoint".into(),
@@ -166,17 +158,28 @@ impl RedisProviderConfig {
                     .into(),
             ));
         }
-        if self.read_from_replica && mode != RedisDeploymentMode::Cluster {
+        if self.tls_insecure_skip_verify && !uses_tls {
             return Err(CacheError::InvalidArgument(
-                "Redis read_from_replica is only supported in cluster mode".into(),
-            ));
-        }
-        if self.tls_insecure_skip_verify && !self.tls_enabled {
-            return Err(CacheError::InvalidArgument(
-                "Redis tls_insecure_skip_verify requires tls_enabled=true".into(),
+                "Redis tls_insecure_skip_verify requires rediss:// endpoints".into(),
             ));
         }
         Ok(())
+    }
+
+    pub(super) fn uses_tls(&self) -> CacheResult<bool> {
+        let mut schemes = self
+            .endpoints
+            .iter()
+            .map(|endpoint| parse_endpoint(endpoint).map(|(_, _, uses_tls)| uses_tls));
+        let first = schemes.next().transpose()?.unwrap_or(false);
+        for scheme in schemes {
+            if scheme? != first {
+                return Err(CacheError::InvalidArgument(
+                    "Redis endpoints must use the same URL scheme".into(),
+                ));
+            }
+        }
+        Ok(first)
     }
 }
 
@@ -202,14 +205,12 @@ impl fmt::Debug for RedisProviderConfig {
             .field("command_timeout_ms", &self.command_timeout_ms)
             .field("key_prefix", &self.key_prefix)
             .field("default_ttl_seconds", &self.default_ttl_seconds)
-            .field("read_from_replica", &self.read_from_replica)
-            .field("tls_enabled", &self.tls_enabled)
             .field("tls_insecure_skip_verify", &self.tls_insecure_skip_verify)
             .finish()
     }
 }
 
-pub(super) fn parse_endpoint(endpoint: &str) -> CacheResult<(String, u16)> {
+pub(super) fn parse_endpoint(endpoint: &str) -> CacheResult<(String, u16, bool)> {
     let url = Url::parse(endpoint).map_err(|_| {
         CacheError::InvalidArgument(
             "Redis endpoints must use valid redis:// or rediss:// URLs".into(),
@@ -243,11 +244,7 @@ pub(super) fn parse_endpoint(endpoint: &str) -> CacheResult<(String, u16)> {
             "Redis endpoint port is invalid".into(),
         ));
     }
-    Ok((host.to_string(), port))
-}
-
-fn validate_endpoint(endpoint: &str) -> CacheResult<()> {
-    parse_endpoint(endpoint).map(|_| ())
+    Ok((host.to_string(), port, url.scheme() == "rediss"))
 }
 
 #[cfg(test)]
@@ -337,26 +334,6 @@ mod tests {
             sentinel.validate(),
             Err(CacheError::InvalidArgument(message)) if message.contains("master_name")
         ));
-
-        let sentinel_replica_reads = RedisProviderConfig {
-            mode: "sentinel".into(),
-            endpoints: vec!["redis://127.0.0.1:26379".into()],
-            master_name: Some("mymaster".into()),
-            read_from_replica: true,
-            ..RedisProviderConfig::default()
-        };
-        assert!(matches!(
-            sentinel_replica_reads.validate(),
-            Err(CacheError::InvalidArgument(message)) if message.contains("only supported in cluster")
-        ));
-
-        let cluster_replica_reads = RedisProviderConfig {
-            mode: "cluster".into(),
-            endpoints: vec!["redis://127.0.0.1:7000".into()],
-            read_from_replica: true,
-            ..RedisProviderConfig::default()
-        };
-        cluster_replica_reads.validate().unwrap();
     }
 
     #[test]
@@ -372,12 +349,31 @@ mod tests {
 
         let insecure_without_tls = RedisProviderConfig {
             tls_insecure_skip_verify: true,
-            tls_enabled: false,
             ..RedisProviderConfig::default()
         };
         assert!(matches!(
             insecure_without_tls.validate(),
-            Err(CacheError::InvalidArgument(message)) if message.contains("tls_enabled")
+            Err(CacheError::InvalidArgument(message)) if message.contains("rediss://")
+        ));
+
+        let insecure_rediss = RedisProviderConfig {
+            endpoints: vec!["rediss://127.0.0.1:6380".into()],
+            tls_insecure_skip_verify: true,
+            ..RedisProviderConfig::default()
+        };
+        insecure_rediss.validate().unwrap();
+
+        let mixed_schemes = RedisProviderConfig {
+            mode: "cluster".into(),
+            endpoints: vec![
+                "redis://127.0.0.1:7000".into(),
+                "rediss://127.0.0.1:7001".into(),
+            ],
+            ..RedisProviderConfig::default()
+        };
+        assert!(matches!(
+            mixed_schemes.validate(),
+            Err(CacheError::InvalidArgument(message)) if message.contains("same URL scheme")
         ));
     }
 

@@ -173,33 +173,20 @@ impl CacheQueueStorage {
             .map_err(|error| cache_error("queue_exists", error))
     }
 
-    pub(super) async fn queue_exists(&self, name: &str) -> bool {
-        match self.queue_exists_result(name).await {
-            Ok(exists) => exists,
-            Err(error) => {
-                tracing::error!(queue = name, error = %error, "queuefs cache queue_exists failed; returning false");
-                false
-            }
-        }
+    pub(super) async fn queue_exists(&self, name: &str) -> Result<bool> {
+        self.queue_exists_result(name).await
     }
 
-    pub(super) async fn list_queues(&self, prefix: &str) -> Vec<String> {
-        let result = self
+    pub(super) async fn list_queues(&self, prefix: &str) -> Result<Vec<String>> {
+        let mut queues = self
             .runtime
             .smembers(&queue_names_key(&self.key_prefix))
             .await
             .map_err(|error| cache_error("list_queues", error))
-            .and_then(bytes_array_to_strings);
-        let mut queues = match result {
-            Ok(values) => values,
-            Err(error) => {
-                tracing::error!(prefix, error = %error, "queuefs cache list_queues failed; returning an empty list");
-                return Vec::new();
-            }
-        };
+            .and_then(bytes_array_to_strings)?;
         queues.retain(|queue| queue.starts_with(prefix));
         queues.sort();
-        queues
+        Ok(queues)
     }
 
     async fn require_queue(&self, queue_name: &str) -> Result<()> {

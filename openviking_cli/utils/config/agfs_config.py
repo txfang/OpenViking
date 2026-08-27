@@ -128,7 +128,6 @@ class QueueFSRedisConfig(BaseModel):
     connect_timeout_ms: int = Field(default=3000, description="Redis connect timeout")
     command_timeout_ms: int = Field(default=3000, description="Redis command timeout")
     key_prefix: str = Field(default="default", description="Redis QueueFS key prefix")
-    tls_enabled: bool = Field(default=False, description="Enable Redis TLS")
     tls_insecure_skip_verify: bool = Field(
         default=False,
         description="Skip Redis TLS certificate verification",
@@ -136,15 +135,34 @@ class QueueFSRedisConfig(BaseModel):
 
     model_config = {"extra": "forbid"}
 
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_deprecated_tls_flag(cls, data):
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        tls_enabled = normalized.pop("tls_enabled", None)
+        if tls_enabled:
+            endpoints = normalized.get("endpoints", ["redis://127.0.0.1:6379"])
+            normalized["endpoints"] = [
+                endpoint.replace("redis://", "rediss://", 1)
+                if endpoint.startswith("redis://")
+                else endpoint
+                for endpoint in endpoints
+            ]
+        return normalized
+
     @model_validator(mode="after")
     def validate_config(self):
         """Validate Redis topology, endpoints, and numeric limits."""
         if not self.endpoints:
             raise ValueError("queuefs redis endpoints must not be empty")
+        schemes = set()
         for endpoint in self.endpoints:
             parsed = urlparse(endpoint)
             if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
                 raise ValueError("queuefs redis endpoints must use redis:// or rediss:// URLs")
+            schemes.add(parsed.scheme)
             try:
                 port = parsed.port
             except ValueError as error:
@@ -178,8 +196,12 @@ class QueueFSRedisConfig(BaseModel):
             raise ValueError("queuefs redis key_prefix must not be empty")
         if "{" in self.key_prefix or "}" in self.key_prefix:
             raise ValueError("queuefs redis key_prefix must not contain '{' or '}'")
-        if self.tls_insecure_skip_verify and not self.tls_enabled:
-            raise ValueError("queuefs redis tls_insecure_skip_verify requires tls_enabled=true")
+        if len(schemes) != 1:
+            raise ValueError("queuefs redis endpoints must use the same URL scheme")
+        if self.tls_insecure_skip_verify and schemes != {"rediss"}:
+            raise ValueError(
+                "queuefs redis tls_insecure_skip_verify requires rediss:// endpoints"
+            )
         return self
 
 
@@ -336,13 +358,33 @@ class RedisCacheConfig(BaseModel):
         description="Reserved compatibility field; unified Runtime requires an empty value",
     )
     default_ttl_seconds: int = Field(default=3600, description="Redis default cache TTL")
-    read_from_replica: bool = Field(default=False, description="Read from Redis replicas")
-    tls_enabled: bool = Field(default=False, description="Enable Redis TLS")
     tls_insecure_skip_verify: bool = Field(
         default=False, description="Skip Redis TLS certificate verification"
     )
 
     model_config = {"extra": "forbid"}
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_deprecated_transport_fields(cls, data):
+        if not isinstance(data, dict):
+            return data
+        normalized = dict(data)
+        replica_reads = normalized.pop("read_from_replica", None)
+        if replica_reads:
+            logger.warning(
+                "Redis read_from_replica is no longer supported; all CacheRuntime reads use the primary"
+            )
+        tls_enabled = normalized.pop("tls_enabled", None)
+        if tls_enabled:
+            endpoints = normalized.get("endpoints", ["redis://127.0.0.1:6379"])
+            normalized["endpoints"] = [
+                endpoint.replace("redis://", "rediss://", 1)
+                if endpoint.startswith("redis://")
+                else endpoint
+                for endpoint in endpoints
+            ]
+        return normalized
 
     @model_validator(mode="after")
     def validate_config(self):
@@ -352,10 +394,12 @@ class RedisCacheConfig(BaseModel):
             raise ValueError("redis mode must be standalone, cluster, or sentinel")
         if not self.endpoints:
             raise ValueError("redis endpoints must not be empty")
+        schemes = set()
         for endpoint in self.endpoints:
             parsed = urlparse(endpoint)
             if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
                 raise ValueError("redis endpoints must use redis:// or rediss:// URLs")
+            schemes.add(parsed.scheme)
             try:
                 port = parsed.port
             except ValueError as error:
@@ -389,16 +433,16 @@ class RedisCacheConfig(BaseModel):
             raise ValueError("redis command_timeout_ms must be > 0")
         if self.default_ttl_seconds < 0:
             raise ValueError("redis default_ttl_seconds must be >= 0")
-        if self.read_from_replica and self.mode != "cluster":
-            raise ValueError("redis read_from_replica is only supported in cluster mode")
+        if len(schemes) != 1:
+            raise ValueError("redis endpoints must use the same URL scheme")
         if self.password_env and self.password:
             raise ValueError("redis password and password_env cannot both be configured")
         if self.sentinel_password_env and self.sentinel_password:
             raise ValueError(
                 "redis sentinel_password and sentinel_password_env cannot both be configured"
             )
-        if self.tls_insecure_skip_verify and not self.tls_enabled:
-            raise ValueError("redis tls_insecure_skip_verify requires tls_enabled=true")
+        if self.tls_insecure_skip_verify and schemes != {"rediss"}:
+            raise ValueError("redis tls_insecure_skip_verify requires rediss:// endpoints")
         return self
 
 

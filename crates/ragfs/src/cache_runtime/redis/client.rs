@@ -28,7 +28,6 @@ pub(super) struct RedisClient {
     concurrency_limit: u32,
     command_timeout: Duration,
     deployment_mode: RedisDeploymentMode,
-    read_from_replica: bool,
     closed: AtomicBool,
 }
 
@@ -45,9 +44,6 @@ impl RedisClient {
                     Duration::from_millis(config.command_timeout_ms);
                 connection.max_command_attempts = 1;
                 connection.max_command_buffer_len = config.pool_size;
-                if config.read_from_replica {
-                    connection.replica.primary_fallback = true;
-                }
             })
             .with_performance_config(|performance| {
                 performance.default_command_timeout =
@@ -78,7 +74,6 @@ impl RedisClient {
             concurrency_limit,
             command_timeout: Duration::from_millis(config.command_timeout_ms),
             deployment_mode,
-            read_from_replica: config.read_from_replica,
             closed: AtomicBool::new(false),
         };
         result.health_check().await?;
@@ -120,11 +115,7 @@ impl RedisClient {
     }
 
     pub(super) async fn get(&self, key: &str) -> CacheResult<Option<Bytes>> {
-        if self.read_from_replica {
-            self.execute("GET", self.client.replicas().get(key)).await
-        } else {
-            self.execute("GET", self.client.get(key)).await
-        }
+        self.execute("GET", self.client.get(key)).await
     }
 
     pub(super) async fn set(
@@ -176,12 +167,7 @@ impl RedisClient {
             }
             return Ok(values);
         }
-        if self.read_from_replica {
-            self.execute("MGET", self.client.replicas().mget(keys.to_vec()))
-                .await
-        } else {
-            self.execute("MGET", self.client.mget(keys.to_vec())).await
-        }
+        self.execute("MGET", self.client.mget(keys.to_vec())).await
     }
 
     pub(super) async fn mset(
@@ -220,31 +206,16 @@ impl RedisClient {
     }
 
     pub(super) async fn sismember(&self, key: &str, member: &[u8]) -> CacheResult<bool> {
-        if self.read_from_replica {
-            self.execute("SISMEMBER", self.client.replicas().sismember(key, member))
-                .await
-        } else {
-            self.execute("SISMEMBER", self.client.sismember(key, member))
-                .await
-        }
+        self.execute("SISMEMBER", self.client.sismember(key, member))
+            .await
     }
 
     pub(super) async fn smembers(&self, key: &str) -> CacheResult<Vec<Bytes>> {
-        if self.read_from_replica {
-            self.execute("SMEMBERS", self.client.replicas().smembers(key))
-                .await
-        } else {
-            self.execute("SMEMBERS", self.client.smembers(key)).await
-        }
+        self.execute("SMEMBERS", self.client.smembers(key)).await
     }
 
     pub(super) async fn scard(&self, key: &str) -> CacheResult<u64> {
-        if self.read_from_replica {
-            self.execute("SCARD", self.client.replicas().scard(key))
-                .await
-        } else {
-            self.execute("SCARD", self.client.scard(key)).await
-        }
+        self.execute("SCARD", self.client.scard(key)).await
     }
 
     pub(super) async fn lpush(&self, key: &str, values: Vec<Bytes>) -> CacheResult<u64> {
@@ -290,30 +261,16 @@ impl RedisClient {
     }
 
     pub(super) async fn llen(&self, key: &str) -> CacheResult<u64> {
-        if self.read_from_replica {
-            self.execute("LLEN", self.client.replicas().llen(key)).await
-        } else {
-            self.execute("LLEN", self.client.llen(key)).await
-        }
+        self.execute("LLEN", self.client.llen(key)).await
     }
 
     pub(super) async fn lrange(&self, key: &str, start: i64, stop: i64) -> CacheResult<Vec<Bytes>> {
-        if self.read_from_replica {
-            self.execute("LRANGE", self.client.replicas().lrange(key, start, stop))
-                .await
-        } else {
-            self.execute("LRANGE", self.client.lrange(key, start, stop))
-                .await
-        }
+        self.execute("LRANGE", self.client.lrange(key, start, stop))
+            .await
     }
 
     pub(super) async fn lindex(&self, key: &str, index: i64) -> CacheResult<Option<Bytes>> {
-        if self.read_from_replica {
-            self.execute("LINDEX", self.client.replicas().lindex(key, index))
-                .await
-        } else {
-            self.execute("LINDEX", self.client.lindex(key, index)).await
-        }
+        self.execute("LINDEX", self.client.lindex(key, index)).await
     }
 
     pub(super) async fn lset(&self, key: &str, index: i64, value: Bytes) -> CacheResult<()> {
@@ -463,7 +420,7 @@ fn fred_config(
     let hosts = config
         .endpoints
         .iter()
-        .map(|endpoint| parse_endpoint(endpoint).map(|(host, port)| Server::new(host, port)))
+        .map(|endpoint| parse_endpoint(endpoint).map(|(host, port, _)| Server::new(host, port)))
         .collect::<CacheResult<Vec<_>>>()?;
     let server = match deployment_mode {
         RedisDeploymentMode::Standalone => ServerConfig::Centralized {
@@ -487,7 +444,7 @@ fn fred_config(
         database: Some(config.db as u8),
         ..Config::default()
     };
-    if config.tls_enabled {
+    if config.uses_tls()? {
         let mut connector = native_tls::TlsConnector::builder();
         if config.tls_insecure_skip_verify {
             connector.danger_accept_invalid_certs(true);

@@ -395,6 +395,26 @@ class OpenVikingConfig(BaseModel):
         cache_value = normalized.get("cache")
         canonical_cache = dict(cache_value) if isinstance(cache_value, dict) else None
 
+        def normalize_redis_params(params: Dict[str, Any]) -> Dict[str, Any]:
+            normalized_params = dict(params)
+            replica_reads = normalized_params.pop("read_from_replica", None)
+            if replica_reads:
+                _get_config_warning_logger().warning(
+                    "Redis read_from_replica is no longer supported; all CacheRuntime reads use the primary"
+                )
+            tls_enabled = normalized_params.pop("tls_enabled", None)
+            if tls_enabled:
+                endpoints = normalized_params.get(
+                    "endpoints", ["redis://127.0.0.1:6379"]
+                )
+                normalized_params["endpoints"] = [
+                    endpoint.replace("redis://", "rediss://", 1)
+                    if endpoint.startswith("redis://")
+                    else endpoint
+                    for endpoint in endpoints
+                ]
+            return normalized_params
+
         def merge_provider(provider: str, params: Dict[str, Any], source: str) -> None:
             nonlocal canonical_cache
             if canonical_cache is None:
@@ -439,6 +459,14 @@ class OpenVikingConfig(BaseModel):
             if provider_was_configured:
                 if not isinstance(provider_params, dict):
                     raise ValueError(f"storage.agfs.cache.{provider} must be an object")
+                provider_params = dict(provider_params)
+                if provider == "redis":
+                    key_prefix = provider_params.pop("key_prefix", "").rstrip(":")
+                    if key_prefix:
+                        cachefs["namespace"] = (
+                            f"{key_prefix}:{cachefs.get('namespace', 'openviking')}"
+                        )
+                        agfs["cachefs"] = cachefs
                 merge_provider(provider, provider_params, "storage.agfs.cache")
 
         queuefs_value = agfs.get("queuefs")
@@ -449,6 +477,8 @@ class OpenVikingConfig(BaseModel):
                 raise ValueError("storage.agfs.queuefs.redis must be an object")
             redis_params = dict(redis_value)
             key_prefix = redis_params.pop("key_prefix", None)
+            redis_params.setdefault("connect_timeout_ms", 3000)
+            redis_params.setdefault("command_timeout_ms", 3000)
             if redis_params.get("mode") == "singleton":
                 redis_params["mode"] = "standalone"
             merge_provider("redis", redis_params, "storage.agfs.queuefs.redis")
@@ -458,6 +488,11 @@ class OpenVikingConfig(BaseModel):
             agfs["queuefs"] = queuefs
 
         if canonical_cache is not None:
+            if canonical_cache.get("provider") == "redis":
+                params = canonical_cache.get("params", {})
+                if not isinstance(params, dict):
+                    raise ValueError("top-level cache params must be an object")
+                canonical_cache["params"] = normalize_redis_params(params)
             normalized["cache"] = canonical_cache
         storage["agfs"] = agfs
         normalized["storage"] = storage

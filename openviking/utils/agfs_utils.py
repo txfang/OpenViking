@@ -184,7 +184,6 @@ def _merge_legacy_queuefs_redis_config(
         "db",
         "connect_timeout_ms",
         "command_timeout_ms",
-        "tls_enabled",
         "tls_insecure_skip_verify",
     )
     for field in fields:

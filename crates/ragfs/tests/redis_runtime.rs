@@ -185,14 +185,13 @@ fn sync_redis_runtime_is_initialized_on_the_runtime_executor() {
 }
 
 #[tokio::test]
-async fn redis_cluster_supports_same_slot_replica_reads_and_cross_slot_errors() {
+async fn redis_cluster_supports_same_slot_reads_and_cross_slot_errors() {
     let Some(endpoints) = topology_endpoints("REDIS_CLUSTER_TEST_URLS") else {
         return;
     };
     let runtime = CacheRuntime::redis(RedisProviderConfig {
         mode: "cluster".into(),
         endpoints,
-        read_from_replica: true,
         connect_timeout_ms: 10_000,
         command_timeout_ms: 3_000,
         default_ttl_seconds: 60,
@@ -211,26 +210,16 @@ async fn redis_cluster_supports_same_slot_replica_reads_and_cross_slot_errors() 
         .await
         .unwrap();
 
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    loop {
-        let values = runtime
+    assert_eq!(
+        runtime
             .mget(&[same_slot_one.clone(), same_slot_two.clone()])
             .await
-            .unwrap();
-        if values
-            == vec![
-                Some(Bytes::from_static(b"one")),
-                Some(Bytes::from_static(b"two")),
-            ]
-        {
-            break;
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "replicas did not observe the writes before the deadline"
-        );
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
+            .unwrap(),
+        vec![
+            Some(Bytes::from_static(b"one")),
+            Some(Bytes::from_static(b"two")),
+        ]
+    );
 
     let cross_slot = runtime
         .mset(vec![

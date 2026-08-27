@@ -123,17 +123,17 @@ impl QueueStorage {
         }
     }
 
-    async fn queue_exists(&self, name: &str) -> bool {
+    async fn queue_exists(&self, name: &str) -> Result<bool> {
         match self {
-            Self::Local(backend) => backend.lock().await.queue_exists(name),
+            Self::Local(backend) => Ok(backend.lock().await.queue_exists(name)),
             #[cfg(feature = "cache")]
             Self::Cache(storage) => storage.queue_exists(name).await,
         }
     }
 
-    async fn list_queues(&self, prefix: &str) -> Vec<String> {
+    async fn list_queues(&self, prefix: &str) -> Result<Vec<String>> {
         match self {
-            Self::Local(backend) => backend.lock().await.list_queues(prefix),
+            Self::Local(backend) => Ok(backend.lock().await.list_queues(prefix)),
             #[cfg(feature = "cache")]
             Self::Cache(storage) => storage.list_queues(prefix).await,
         }
@@ -435,7 +435,7 @@ impl FileSystem for QueueFileSystem {
 
         // Root directory: list all top-level queues
         if parsed.queue_name.is_none() {
-            let queues = self.storage.list_queues("").await;
+            let queues = self.storage.list_queues("").await?;
             let mut top_level = std::collections::HashSet::new();
 
             for q in queues {
@@ -458,7 +458,7 @@ impl FileSystem for QueueFileSystem {
 
         // Queue directory: check if it has nested queues
         let queue_name = parsed.queue_name.unwrap();
-        let all_queues = self.storage.list_queues(&queue_name).await;
+        let all_queues = self.storage.list_queues(&queue_name).await?;
 
         let has_nested = all_queues
             .iter()
@@ -490,7 +490,7 @@ impl FileSystem for QueueFileSystem {
         }
 
         // Leaf queue: return control files
-        if !self.storage.queue_exists(&queue_name).await {
+        if !self.storage.queue_exists(&queue_name).await? {
             return Err(Error::NotFound(format!("queue not found: {}", queue_name)));
         }
 
@@ -514,7 +514,7 @@ impl FileSystem for QueueFileSystem {
         if parsed.is_dir {
             // Queue directory
             let queue_name = parsed.queue_name.unwrap();
-            if self.storage.queue_exists(&queue_name).await {
+            if self.storage.queue_exists(&queue_name).await? {
                 Ok(FileInfo {
                     name: queue_name
                         .split('/')
@@ -1303,6 +1303,21 @@ mod tests {
             fs.mkdir("/must-not-fallback", 0o755).await,
             Err(Error::Network(_))
         ));
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn cache_runtime_failure_is_propagated_by_stat_and_read_dir() {
+        let provider = std::sync::Arc::new(crate::cache_runtime::MemoryMockProvider::new());
+        let runtime = crate::cache_runtime::CacheRuntime::memory_with_provider(provider.clone());
+        let fs = QueueFileSystem::with_cache_runtime(runtime, "queuefs-runtime-errors".to_string())
+            .await
+            .unwrap();
+
+        provider.set_unavailable(true);
+
+        assert!(matches!(fs.stat("/Semantic").await, Err(Error::Network(_))));
+        assert!(matches!(fs.read_dir("/").await, Err(Error::Network(_))));
     }
 
     #[tokio::test]

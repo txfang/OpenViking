@@ -30,8 +30,7 @@ openviking-server doctor
       "pool_size": 32,
       "connect_timeout_ms": 1000,
       "command_timeout_ms": 1000,
-      "default_ttl_seconds": 3600,
-      "read_from_replica": false
+      "default_ttl_seconds": 3600
     }
   },
   "storage": {
@@ -109,7 +108,7 @@ Redis 配置：
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `mode` | `"standalone"` | Redis 部署模式 |
-| `endpoints` | `["redis://127.0.0.1:6379"]` | Redis 连接地址 |
+| `endpoints` | `["redis://127.0.0.1:6379"]` | Redis 连接地址；`redis://` 使用明文传输，`rediss://` 使用 TLS |
 | `username` | `""` | Redis ACL 用户名 |
 | `password_env` | `""` | 存放 Redis 密码的环境变量名 |
 | `pool_size` | `32` | 命令并发数 |
@@ -117,7 +116,9 @@ Redis 配置：
 | `command_timeout_ms` | `20` | 命令超时 |
 | `key_prefix` | `""` | 保留兼容字段；统一 Runtime 要求为空 |
 | `default_ttl_seconds` | `3600` | 默认 TTL；`0` 表示不设置 TTL |
-| `read_from_replica` | `false` | 仅 Cluster 模式支持；CacheFS 可按一致性要求选择是否开启 |
+| `tls_insecure_skip_verify` | `false` | 跳过 `rediss://` 证书校验，仅用于受控测试环境 |
+
+所有 Redis 读命令均发送到主节点，避免 QueueFS 读取到延迟的队列状态。需要传输加密时使用 Redis TLS，CacheRuntime 不额外增加应用层数据加密格式。
 
 未来 DynamicProvider 配置结构：
 

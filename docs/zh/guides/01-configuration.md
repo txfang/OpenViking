@@ -1180,7 +1180,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `mode` | str | Redis 拓扑模式：`"singleton"`、`"cluster"` 或 `"sentinel"` | `"singleton"` |
-| `endpoints` | array[str] | Singleton 的唯一数据节点、Cluster 初始节点或 Sentinel 节点；仅允许协议、主机和端口，认证与 DB 使用独立字段 | `["redis://127.0.0.1:6379"]` |
+| `endpoints` | array[str] | Singleton 的唯一数据节点、Cluster 初始节点或 Sentinel 节点；`redis://` 使用明文传输，`rediss://` 使用 TLS | `["redis://127.0.0.1:6379"]` |
 | `master_name` | str（可选） | Sentinel master 名称；Sentinel 模式必须配置 | `null` |
 | `username` | str（可选） | Redis ACL 用户名 | `null` |
 | `password` | str（可选） | Redis ACL 密码 | `null` |
@@ -1190,7 +1190,6 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 | `connect_timeout_ms` | int | Redis 数据节点物理建连超时，单位毫秒 | `3000` |
 | `command_timeout_ms` | int | 命令读写超时，单位毫秒 | `3000` |
 | `key_prefix` | str | Redis key 隔离前缀，不能为空；所有 QueueFS key 使用 `{key_prefix}:ov:*` | `"default"` |
-| `tls_enabled` | bool | 对 `redis://` endpoint 强制启用 TLS | `false` |
 | `tls_insecure_skip_verify` | bool | 跳过 TLS 证书校验，仅用于受控测试环境 | `false` |
 
 说明：
@@ -1207,7 +1206,8 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 - Cache backend 使用 `{cache_key_prefix}:ov:*` key；连接同一 Redis 集群的不同环境或租户必须配置不同的 `cache_key_prefix`。
 - Redis backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。
 - Redis backend 会在独立的 startup recovery 线程中按实例心跳状态执行三次有界 `recover_stale` 扫描，时间点分别为启动后立即、30 秒和 60 秒，用于覆盖容器异常退出后旧实例心跳尚未过期的恢复窗口；运行期间不做长期周期恢复。
-- `tls_insecure_skip_verify=true` 时必须同时设置 `tls_enabled=true`。
+- 所有 Redis 读命令都发送到主节点，不提供副本读配置。
+- `tls_insecure_skip_verify=true` 时 endpoint 必须使用 `rediss://`。
 - 如果同时设置了 `storage.agfs.queuefs.db_path` 和旧字段 `storage.agfs.queue_db_path`，以前者为准。
 - 如果 QueueFS backend 为 `memory`，则 `db_path` 和旧字段 `queue_db_path` 都会被忽略。
 
@@ -1252,7 +1252,6 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
           "connect_timeout_ms": 3000,
           "command_timeout_ms": 3000,
           "key_prefix": "default",
-          "tls_enabled": false,
           "tls_insecure_skip_verify": false
         }
       }
