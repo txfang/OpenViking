@@ -4,6 +4,7 @@ mod api;
 mod dynamic;
 mod error;
 mod executor;
+#[cfg(any(test, feature = "test-utils"))]
 mod memory;
 mod provider;
 mod redis;
@@ -15,6 +16,7 @@ pub use api::{
 };
 pub use dynamic::DynamicProviderConfig;
 pub use error::{CacheError, CacheResult};
+#[cfg(any(test, feature = "test-utils"))]
 pub use memory::MemoryMockProvider;
 pub use redis::{RedisDeploymentMode, RedisProviderConfig};
 
@@ -52,6 +54,7 @@ pub struct CacheRuntime {
 }
 
 impl CacheRuntime {
+    #[cfg(any(test, feature = "test-utils"))]
     pub(crate) fn from_provider(provider: Arc<dyn CacheProvider>) -> Arc<Self> {
         Self::from_provider_with_scripts(provider, Arc::new(ScriptRegistry::default()))
     }
@@ -79,11 +82,13 @@ impl CacheRuntime {
     }
 
     /// Build an in-process runtime for tests and smoke validation.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn memory() -> Arc<Self> {
         Self::memory_with_provider(Arc::new(MemoryMockProvider::new()))
     }
 
     /// Build a Runtime around one controllable in-memory provider.
+    #[cfg(any(test, feature = "test-utils"))]
     pub fn memory_with_provider(provider: Arc<MemoryMockProvider>) -> Arc<Self> {
         Self::from_provider(provider)
     }

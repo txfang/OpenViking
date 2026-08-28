@@ -21,12 +21,12 @@ path = "src/shell/main.rs"
 [[test]]
 name = "cache_wrapper"
 path = "tests/cache_wrapper.rs"
-required-features = ["cache"]
+required-features = ["cache", "test-utils"]
 
 [[test]]
 name = "cache_runtime"
 path = "tests/cache_runtime.rs"
-required-features = ["cache"]
+required-features = ["cache", "test-utils"]
 
 [[test]]
 name = "redis_runtime"
@@ -137,5 +137,6 @@ uuid = { version = "1.0", features = ["v4"] }
 [features]
 default = []
 cache = ["dep:fred", "dep:native-tls"]
+test-utils = []
 s3 = ["aws-sdk-s3", "aws-config", "aws-types"]
 full = ["s3", "cache"]
