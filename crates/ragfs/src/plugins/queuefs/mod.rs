@@ -107,6 +107,14 @@ enum QueueStorage {
 }
 
 impl QueueStorage {
+    async fn shutdown(&self) -> Result<()> {
+        match self {
+            Self::Local(_) => Ok(()),
+            #[cfg(feature = "cache")]
+            Self::Cache(storage) => storage.shutdown().await,
+        }
+    }
+
     async fn create_queue(&self, name: &str) -> Result<()> {
         match self {
             Self::Local(backend) => backend.lock().await.create_queue(name),
@@ -224,6 +232,10 @@ impl QueueFileSystem {
                 CacheQueueStorage::open(runtime, key_prefix).await?,
             )),
         })
+    }
+
+    pub(crate) async fn shutdown(&self) -> Result<()> {
+        self.storage.shutdown().await
     }
 
     /// Check if a name is a control operation
@@ -602,7 +614,7 @@ impl QueueFSPlugin {
                     "backend",
                     "string",
                     "memory",
-                    "Queue backend (memory, sqlite, sqlite3, redis)",
+                    "Queue backend (memory, sqlite, sqlite3, cache)",
                 ),
                 ConfigParameter::optional(
                     "db_path",
@@ -621,12 +633,6 @@ impl QueueFSPlugin {
                     "int",
                     "5000",
                     "SQLite busy timeout in milliseconds",
-                ),
-                ConfigParameter::optional(
-                    "redis",
-                    "json",
-                    "{}",
-                    "Redis connection settings when backend=redis",
                 ),
                 #[cfg(feature = "cache")]
                 ConfigParameter::optional(
@@ -659,7 +665,7 @@ impl QueueFSPlugin {
     fn parse_backend_config(config: &PluginConfig) -> Result<ParsedBackendConfig> {
         let backend_name = Self::get_string_param(config, "backend").unwrap_or("memory");
         #[cfg(feature = "cache")]
-        let valid_backends = ["memory", "sqlite", "sqlite3", "redis", "cache"];
+        let valid_backends = ["memory", "sqlite", "sqlite3", "cache"];
         #[cfg(not(feature = "cache"))]
         let valid_backends = ["memory", "sqlite", "sqlite3"];
         if !valid_backends.contains(&backend_name) {
@@ -674,7 +680,7 @@ impl QueueFSPlugin {
             "memory" => BackendKind::Memory,
             "sqlite" | "sqlite3" => BackendKind::Sqlite,
             #[cfg(feature = "cache")]
-            "cache" | "redis" => BackendKind::Cache,
+            "cache" => BackendKind::Cache,
             _ => {
                 return Err(Error::config(format!(
                     "unsupported queue backend: {}",
@@ -718,13 +724,9 @@ impl QueueFSPlugin {
         #[cfg(feature = "cache")]
         let cache_key_prefix = match kind {
             BackendKind::Cache => {
-                let prefix = if backend_name == "redis" {
-                    legacy_redis_key_prefix(config)?
-                } else {
-                    Self::get_string_param(config, "cache_key_prefix")
-                        .unwrap_or("default")
-                        .to_string()
-                };
+                let prefix = Self::get_string_param(config, "cache_key_prefix")
+                    .unwrap_or("default")
+                    .to_string();
                 if prefix.trim().is_empty() || prefix.contains(['{', '}']) {
                     return Err(Error::config(
                         "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
@@ -746,30 +748,6 @@ impl QueueFSPlugin {
             #[cfg(feature = "cache")]
             cache_key_prefix,
         })
-    }
-}
-
-#[cfg(feature = "cache")]
-fn legacy_redis_key_prefix(config: &PluginConfig) -> Result<String> {
-    let redis = match config.params.get("redis") {
-        Some(crate::core::types::ConfigValue::Json(value)) => {
-            value.as_object().ok_or_else(|| {
-                Error::config("queuefs redis config must be a JSON object".to_string())
-            })?
-        }
-        Some(_) => {
-            return Err(Error::config(
-                "queuefs redis config must be a JSON object".to_string(),
-            ))
-        }
-        None => return Ok("default".to_string()),
-    };
-    match redis.get("key_prefix") {
-        Some(serde_json::Value::String(value)) => Ok(value.clone()),
-        Some(_) => Err(Error::config(
-            "queuefs redis key_prefix must be a string".to_string(),
-        )),
-        None => Ok("default".to_string()),
     }
 }
 
@@ -883,21 +861,6 @@ mod tests {
     struct TestQueueMessage {
         id: String,
         data: String,
-    }
-
-    /// Build a QueueFS plugin config containing a nested Redis object.
-    #[cfg(feature = "cache")]
-    fn redis_plugin_config(redis: serde_json::Value) -> PluginConfig {
-        let mut params = std::collections::HashMap::new();
-        params.insert(
-            "backend".to_string(),
-            crate::core::types::ConfigValue::String("redis".to_string()),
-        );
-        params.insert(
-            "redis".to_string(),
-            crate::core::types::ConfigValue::Json(redis),
-        );
-        PluginConfig::single_backend("queuefs", "/queue", params)
     }
 
     /// Create a queue filesystem with one initialized queue.
@@ -1125,7 +1088,7 @@ mod tests {
         let config_params = plugin.config_params();
         assert_eq!(
             config_params.len(),
-            5 + usize::from(cfg!(feature = "cache"))
+            4 + usize::from(cfg!(feature = "cache"))
         );
         #[cfg(feature = "cache")]
         assert!(config_params
@@ -1145,32 +1108,6 @@ mod tests {
         enqueue(fs.as_ref(), "test", b"test").await;
         let msg = dequeue_msg(fs.as_ref(), "test").await;
         assert_eq!(msg.data, "test");
-    }
-
-    #[cfg(feature = "cache")]
-    #[test]
-    fn legacy_redis_backend_is_normalized_to_cache_runtime() {
-        let parsed = QueueFSPlugin::parse_backend_config(&redis_plugin_config(serde_json::json!({
-            "mode": "singleton",
-            "endpoints": ["redis://127.0.0.1:6379"],
-            "key_prefix": "tenant-a"
-        })))
-        .unwrap();
-
-        assert!(matches!(parsed.kind, BackendKind::Cache));
-        assert_eq!(parsed.cache_key_prefix.as_deref(), Some("tenant-a"));
-    }
-
-    #[cfg(feature = "cache")]
-    #[test]
-    fn legacy_redis_backend_rejects_invalid_namespace() {
-        let error = QueueFSPlugin::parse_backend_config(&redis_plugin_config(
-            serde_json::json!({"key_prefix": "invalid{tag}"}),
-        ))
-        .unwrap_err()
-        .to_string();
-
-        assert!(error.contains("key_prefix"));
     }
 
     #[tokio::test]
@@ -1247,7 +1184,6 @@ mod tests {
         let runtime =
             crate::cache_runtime::CacheRuntime::redis(crate::cache_runtime::RedisProviderConfig {
                 endpoints: vec![endpoint],
-                key_prefix: String::new(),
                 command_timeout_ms: 1_000,
                 ..crate::cache_runtime::RedisProviderConfig::default()
             })
@@ -1284,7 +1220,6 @@ mod tests {
         let runtime =
             crate::cache_runtime::CacheRuntime::redis(crate::cache_runtime::RedisProviderConfig {
                 endpoints: vec![endpoint],
-                key_prefix: String::new(),
                 command_timeout_ms: 1_000,
                 ..crate::cache_runtime::RedisProviderConfig::default()
             })

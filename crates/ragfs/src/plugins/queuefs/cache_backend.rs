@@ -11,9 +11,10 @@ use crate::cache_runtime::{
 };
 use crate::core::errors::{Error, Result};
 use bytes::Bytes;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use uuid::Uuid;
@@ -72,9 +73,10 @@ pub(super) struct CacheQueueStorage {
     key_prefix: String,
     instance_id: String,
     heartbeat_stop: watch::Sender<bool>,
-    heartbeat_task: JoinHandle<()>,
+    heartbeat_task: Mutex<Option<JoinHandle<()>>>,
     recovery_stop: watch::Sender<bool>,
-    recovery_task: JoinHandle<()>,
+    recovery_task: Mutex<Option<JoinHandle<()>>>,
+    closed: AtomicBool,
 }
 
 impl CacheQueueStorage {
@@ -106,10 +108,46 @@ impl CacheQueueStorage {
             key_prefix,
             instance_id,
             heartbeat_stop,
-            heartbeat_task,
+            heartbeat_task: Mutex::new(Some(heartbeat_task)),
             recovery_stop,
-            recovery_task,
+            recovery_task: Mutex::new(Some(recovery_task)),
+            closed: AtomicBool::new(false),
         })
+    }
+
+    pub(super) async fn shutdown(&self) -> Result<()> {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+        let _ = self.heartbeat_stop.send(true);
+        let _ = self.recovery_stop.send(true);
+
+        let mut task_error = None;
+        for task in [
+            self.heartbeat_task.lock().await.take(),
+            self.recovery_task.lock().await.take(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if let Err(error) = task.await {
+                task_error.get_or_insert_with(|| {
+                    Error::internal(format!("queuefs cache background task failed: {error}"))
+                });
+            }
+        }
+
+        let key = heartbeat_key(&self.key_prefix, &self.instance_id);
+        let delete_result = self
+            .runtime
+            .del(&[key])
+            .await
+            .map(|_| ())
+            .map_err(|error| cache_error("shutdown heartbeat cleanup", error));
+        match task_error {
+            Some(error) => Err(error),
+            None => delete_result,
+        }
     }
 
     async fn execute(
@@ -380,10 +418,21 @@ impl CacheQueueStorage {
 
 impl Drop for CacheQueueStorage {
     fn drop(&mut self) {
+        if self.closed.swap(true, Ordering::AcqRel) {
+            return;
+        }
         let _ = self.heartbeat_stop.send(true);
         let _ = self.recovery_stop.send(true);
-        self.heartbeat_task.abort();
-        self.recovery_task.abort();
+        if let Ok(mut task) = self.heartbeat_task.try_lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+        if let Ok(mut task) = self.recovery_task.try_lock() {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
         let key = heartbeat_key(&self.key_prefix, &self.instance_id);
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             let runtime = Arc::clone(&self.runtime);
@@ -599,5 +648,64 @@ mod tests {
         assert!(sync.get(&heartbeat).unwrap().is_some());
         drop(storage);
         assert!(sync.get(&heartbeat).unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn shutdown_removes_heartbeat_before_returning() {
+        let runtime = CacheRuntime::memory();
+        let storage =
+            CacheQueueStorage::open(Arc::clone(&runtime), "async-shutdown-test".to_string())
+                .await
+                .unwrap();
+        let heartbeat = heartbeat_key("async-shutdown-test", &storage.instance_id);
+
+        assert!(runtime.get(&heartbeat).await.unwrap().is_some());
+        storage.shutdown().await.unwrap();
+        assert!(runtime.get(&heartbeat).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn graceful_shutdown_allows_immediate_processing_recovery() {
+        let Ok(endpoint) = std::env::var("REDIS_URL") else {
+            return;
+        };
+        let runtime = CacheRuntime::redis(crate::cache_runtime::RedisProviderConfig {
+            endpoints: vec![endpoint],
+            connect_timeout_ms: 5_000,
+            command_timeout_ms: 1_000,
+            default_ttl_seconds: 60,
+            ..crate::cache_runtime::RedisProviderConfig::default()
+        })
+        .await
+        .unwrap();
+        let prefix = format!("queuefs-shutdown-test:{}", Uuid::new_v4());
+        let first = CacheQueueStorage::open(Arc::clone(&runtime), prefix.clone())
+            .await
+            .unwrap();
+        first.create_queue("jobs").await.unwrap();
+        let message = Message::new(b"payload".to_vec());
+        let message_id = message.id.clone();
+        first.enqueue("jobs", message).await.unwrap();
+        assert_eq!(first.dequeue("jobs").await.unwrap().unwrap().id, message_id);
+
+        first.shutdown().await.unwrap();
+        let second = CacheQueueStorage::open(Arc::clone(&runtime), prefix.clone())
+            .await
+            .unwrap();
+        let recovered = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if let Some(message) = second.dequeue("jobs").await.unwrap() {
+                    break message;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(recovered.id, message_id);
+        second.shutdown().await.unwrap();
+        runtime.del(&[queue_names_key(&prefix)]).await.unwrap();
+        runtime.close().await.unwrap();
     }
 }

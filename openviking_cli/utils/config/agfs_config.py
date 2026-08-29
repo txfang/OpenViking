@@ -108,103 +108,6 @@ class S3Config(BaseModel):
         return self
 
 
-class QueueFSRedisConfig(BaseModel):
-    """Configuration for the QueueFS Redis backend."""
-
-    mode: Literal["singleton", "cluster", "sentinel"] = Field(
-        default="singleton",
-        description="Redis topology mode.",
-    )
-    endpoints: list[str] = Field(
-        default_factory=lambda: ["redis://127.0.0.1:6379"],
-        description="Redis endpoints interpreted by the selected topology mode.",
-    )
-    master_name: Optional[str] = Field(default=None, description="Sentinel master name")
-    username: Optional[str] = Field(default=None, description="Redis ACL username")
-    password: Optional[str] = Field(default=None, description="Redis ACL password")
-    sentinel_username: Optional[str] = Field(default=None, description="Sentinel ACL username")
-    sentinel_password: Optional[str] = Field(default=None, description="Sentinel ACL password")
-    db: int = Field(default=0, description="Redis database number")
-    connect_timeout_ms: int = Field(default=3000, description="Redis connect timeout")
-    command_timeout_ms: int = Field(default=3000, description="Redis command timeout")
-    key_prefix: str = Field(default="default", description="Redis QueueFS key prefix")
-    tls_insecure_skip_verify: bool = Field(
-        default=False,
-        description="Skip Redis TLS certificate verification",
-    )
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_deprecated_tls_flag(cls, data):
-        if not isinstance(data, dict):
-            return data
-        normalized = dict(data)
-        tls_enabled = normalized.pop("tls_enabled", None)
-        if tls_enabled:
-            endpoints = normalized.get("endpoints", ["redis://127.0.0.1:6379"])
-            normalized["endpoints"] = [
-                endpoint.replace("redis://", "rediss://", 1)
-                if endpoint.startswith("redis://")
-                else endpoint
-                for endpoint in endpoints
-            ]
-        return normalized
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        """Validate Redis topology, endpoints, and numeric limits."""
-        if not self.endpoints:
-            raise ValueError("queuefs redis endpoints must not be empty")
-        schemes = set()
-        for endpoint in self.endpoints:
-            parsed = urlparse(endpoint)
-            if parsed.scheme not in {"redis", "rediss"} or not parsed.hostname:
-                raise ValueError("queuefs redis endpoints must use redis:// or rediss:// URLs")
-            schemes.add(parsed.scheme)
-            try:
-                port = parsed.port
-            except ValueError as error:
-                raise ValueError("queuefs redis endpoint port is invalid") from error
-            if port == 0:
-                raise ValueError("queuefs redis endpoint port is invalid")
-            if (
-                parsed.username is not None
-                or parsed.password is not None
-                or parsed.path not in {"", "/"}
-                or parsed.query
-                or parsed.fragment
-            ):
-                raise ValueError(
-                    "queuefs redis endpoints must not include credentials, database paths, "
-                    "query parameters, or fragments; use dedicated redis fields"
-                )
-        if self.mode == "singleton" and len(self.endpoints) != 1:
-            raise ValueError("queuefs redis singleton mode requires exactly one endpoint")
-        if self.mode == "cluster" and self.db != 0:
-            raise ValueError("queuefs redis cluster mode requires db=0")
-        if self.mode == "sentinel" and not (self.master_name or "").strip():
-            raise ValueError("queuefs redis sentinel mode requires master_name")
-        if self.db < 0:
-            raise ValueError("queuefs redis db must be >= 0")
-        if self.connect_timeout_ms <= 0:
-            raise ValueError("queuefs redis connect_timeout_ms must be > 0")
-        if self.command_timeout_ms <= 0:
-            raise ValueError("queuefs redis command_timeout_ms must be > 0")
-        if not self.key_prefix.strip():
-            raise ValueError("queuefs redis key_prefix must not be empty")
-        if "{" in self.key_prefix or "}" in self.key_prefix:
-            raise ValueError("queuefs redis key_prefix must not contain '{' or '}'")
-        if len(schemes) != 1:
-            raise ValueError("queuefs redis endpoints must use the same URL scheme")
-        if self.tls_insecure_skip_verify and schemes != {"rediss"}:
-            raise ValueError(
-                "queuefs redis tls_insecure_skip_verify requires rediss:// endpoints"
-            )
-        return self
-
-
 class QueueFSConfig(BaseModel):
     """Configuration for QueueFS backend."""
 
@@ -215,7 +118,7 @@ class QueueFSConfig(BaseModel):
 
     backend: str = Field(
         default="sqlite",
-        description="QueueFS backend: 'memory' | 'sqlite' | 'sqlite3' | 'redis' | 'cache'",
+        description="QueueFS backend: 'memory' | 'sqlite' | 'sqlite3' | 'cache'",
     )
 
     db_path: Optional[str] = Field(
@@ -233,8 +136,6 @@ class QueueFSConfig(BaseModel):
         description="SQLite busy timeout for QueueFS in milliseconds.",
     )
 
-    redis: QueueFSRedisConfig = Field(default_factory=QueueFSRedisConfig)
-
     cache_key_prefix: str = Field(
         default="default",
         description="Queue key namespace when backend is 'cache'.",
@@ -248,10 +149,11 @@ class QueueFSConfig(BaseModel):
         if self.mode not in valid_modes:
             raise ValueError("queuefs mode must be one of: 'shared', 'worker'")
 
-        valid_backends = {"memory", "sqlite", "sqlite3", "redis", "cache"}
+        valid_backends = {"memory", "sqlite", "sqlite3", "cache"}
         if self.backend not in valid_backends:
             raise ValueError(
-                "queuefs backend must be one of: 'memory', 'sqlite', 'sqlite3', 'redis', 'cache'"
+                "queuefs backend must be one of: 'memory', 'sqlite', 'sqlite3', 'cache'; "
+                "backend='redis' was removed, use backend='cache' with top-level cache.provider/cache.params"
             )
         if self.recover_stale_sec < 0:
             raise ValueError("queuefs recover_stale_sec must be >= 0")
@@ -264,16 +166,6 @@ class QueueFSConfig(BaseModel):
                 "queuefs cache_key_prefix must be non-empty and must not contain '{' or '}'"
             )
         return self
-
-
-class AGFSCacheProvider(str, Enum):
-    """Cache providers supported by RAGFS."""
-
-    REDIS = "redis"
-    DYNAMIC = "dynamic"
-    MEMORY = "memory"
-    YUANRONG = "yuanrong"
-    MOONCAKE = "mooncake"
 
 
 class AGFSCacheTraversalMode(str, Enum):
@@ -315,15 +207,6 @@ class AGFSCacheFSConfig(BaseModel):
         return self
 
 
-class DynamicCacheConfig(BaseModel):
-    """Configuration passed to a versioned dynamic cache provider."""
-
-    library: str = Field(default="", description="Provider dynamic library path")
-    params: dict[str, Any] = Field(default_factory=dict, description="Provider-owned parameters")
-
-    model_config = {"extra": "forbid"}
-
-
 class RedisCacheConfig(BaseModel):
     """Configuration for Redis cache provider."""
 
@@ -353,10 +236,6 @@ class RedisCacheConfig(BaseModel):
     pool_size: int = Field(default=32, description="Redis command concurrency")
     connect_timeout_ms: int = Field(default=1000, description="Redis connect timeout")
     command_timeout_ms: int = Field(default=20, description="Redis command timeout")
-    key_prefix: str = Field(
-        default="",
-        description="Reserved compatibility field; unified Runtime requires an empty value",
-    )
     default_ttl_seconds: int = Field(default=3600, description="Redis default cache TTL")
     tls_insecure_skip_verify: bool = Field(
         default=False, description="Skip Redis TLS certificate verification"
@@ -364,32 +243,8 @@ class RedisCacheConfig(BaseModel):
 
     model_config = {"extra": "forbid"}
 
-    @model_validator(mode="before")
-    @classmethod
-    def normalize_deprecated_transport_fields(cls, data):
-        if not isinstance(data, dict):
-            return data
-        normalized = dict(data)
-        replica_reads = normalized.pop("read_from_replica", None)
-        if replica_reads:
-            logger.warning(
-                "Redis read_from_replica is no longer supported; all CacheRuntime reads use the primary"
-            )
-        tls_enabled = normalized.pop("tls_enabled", None)
-        if tls_enabled:
-            endpoints = normalized.get("endpoints", ["redis://127.0.0.1:6379"])
-            normalized["endpoints"] = [
-                endpoint.replace("redis://", "rediss://", 1)
-                if endpoint.startswith("redis://")
-                else endpoint
-                for endpoint in endpoints
-            ]
-        return normalized
-
     @model_validator(mode="after")
     def validate_config(self):
-        if self.mode == "singleton":
-            self.mode = "standalone"
         if self.mode not in {"standalone", "cluster", "sentinel"}:
             raise ValueError("redis mode must be standalone, cluster, or sentinel")
         if not self.endpoints:
@@ -443,54 +298,6 @@ class RedisCacheConfig(BaseModel):
             )
         if self.tls_insecure_skip_verify and schemes != {"rediss"}:
             raise ValueError("redis tls_insecure_skip_verify requires rediss:// endpoints")
-        return self
-
-
-class AGFSCacheConfig(BaseModel):
-    """Configuration for optional RAGFS cache layer."""
-
-    enabled: bool = Field(default=False, description="Enable RAGFS cache")
-    provider: AGFSCacheProvider = Field(
-        default=AGFSCacheProvider.REDIS,
-        description="RAGFS cache provider",
-    )
-    namespace: str = Field(default="openviking", description="RAGFS cache namespace")
-    max_file_size_bytes: int = Field(
-        default=1024 * 1024,
-        description="Maximum full-file object size admitted to cache",
-    )
-    traversal_mode: AGFSCacheTraversalMode = Field(
-        default=AGFSCacheTraversalMode.BACKEND,
-        description="Traversal strategy for tree, glob, and grep",
-    )
-    bypass_prefixes: list[str] = Field(
-        default_factory=list,
-        description="Path prefixes that bypass cache",
-    )
-    redis: RedisCacheConfig = Field(default_factory=RedisCacheConfig)
-    dynamic: DynamicCacheConfig = Field(default_factory=DynamicCacheConfig)
-
-    model_config = {"extra": "forbid"}
-
-    @model_validator(mode="after")
-    def validate_config(self):
-        if not self.namespace.strip():
-            raise ValueError("cache namespace must not be empty")
-        if self.max_file_size_bytes <= 0:
-            raise ValueError("cache max_file_size_bytes must be > 0")
-        if self.enabled and self.provider not in {
-            AGFSCacheProvider.REDIS,
-            AGFSCacheProvider.DYNAMIC,
-        }:
-            raise ValueError("enabled cache provider must be 'redis' or 'dynamic'")
-        if self.enabled and self.provider == AGFSCacheProvider.DYNAMIC:
-            if not self.dynamic.library.strip():
-                raise ValueError("dynamic cache library must not be empty")
-        if self.enabled and self.provider == AGFSCacheProvider.REDIS:
-            if self.redis.key_prefix:
-                raise ValueError(
-                    "redis cache key_prefix must be empty because Runtime keys are fully qualified"
-                )
         return self
 
 
@@ -597,12 +404,6 @@ class AGFSConfig(BaseModel):
     cachefs: AGFSCacheFSConfig = Field(
         default_factory=AGFSCacheFSConfig,
         description="CacheFS configuration.",
-    )
-
-    cache: AGFSCacheConfig = Field(
-        default_factory=AGFSCacheConfig,
-        description="Deprecated nested cache and Provider configuration.",
-        exclude=True,
     )
 
     pathlock: AGFSPathLockConfig = Field(

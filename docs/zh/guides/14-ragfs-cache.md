@@ -70,6 +70,21 @@ openviking-server
 
 `MemoryMockProvider` 只用于单元测试和 smoke test，不是生产配置项。
 
+## 配置破坏性变更
+
+旧缓存配置不再兼容，升级前需要完成迁移：
+
+| 已删除配置 | 标准替代配置 |
+|-----------|-------------|
+| `storage.agfs.cache` | 顶层 `cache.provider` + `cache.params`，并设置 `storage.agfs.cachefs.backend="cache"` |
+| `storage.agfs.queuefs.backend="redis"` 和 `queuefs.redis` | `storage.agfs.queuefs.backend="cache"`，并复用顶层 `cache` 配置 |
+| Redis `mode="singleton"` | `mode="standalone"` |
+| `tls_enabled=true` | endpoint 使用 `rediss://` |
+| `read_from_replica` | 已删除，所有读命令统一访问主节点 |
+| Redis Provider `key_prefix` | CacheFS 使用 `cachefs.namespace`；QueueFS 使用 `queuefs.cache_key_prefix` |
+
+OpenViking 会对已删除字段直接返回迁移错误，不再静默转换。
+
 ## 后续 DynamicProvider
 
 本期标准 OpenViking wheel 只内置 RedisProvider。DynamicProvider、`.so` 加载器和版本化 C ABI 放在后续阶段实现；当前配置 `provider=dynamic` 会在启动阶段返回 UnsupportedProvider。
@@ -114,7 +129,6 @@ Redis 配置：
 | `pool_size` | `32` | 命令并发数 |
 | `connect_timeout_ms` | `1000` | 连接超时 |
 | `command_timeout_ms` | `20` | 命令超时 |
-| `key_prefix` | `""` | 保留兼容字段；统一 Runtime 要求为空 |
 | `default_ttl_seconds` | `3600` | 默认 TTL；`0` 表示不设置 TTL |
 | `tls_insecure_skip_verify` | `false` | 跳过 `rediss://` 证书校验，仅用于受控测试环境 |
 

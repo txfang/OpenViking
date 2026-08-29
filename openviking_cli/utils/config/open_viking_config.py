@@ -319,8 +319,7 @@ class OpenVikingConfig(BaseModel):
     def _validate_cache_runtime_config(self) -> "OpenVikingConfig":
         agfs = self.storage.agfs
         uses_canonical_cache = agfs.cachefs.backend == "cache" or agfs.queuefs.backend == "cache"
-        has_legacy_cache = bool(agfs.cache.model_fields_set)
-        if uses_canonical_cache and self.cache is None and not has_legacy_cache:
+        if uses_canonical_cache and self.cache is None:
             raise ValueError("top-level cache config is required when an AGFS backend uses cache")
         return self
 
@@ -378,125 +377,30 @@ class OpenVikingConfig(BaseModel):
 
     @model_validator(mode="before")
     @classmethod
-    def _normalize_legacy_cache_config(cls, data: Any) -> Any:
+    def _reject_removed_cache_config(cls, data: Any) -> Any:
         if not isinstance(data, dict):
             return data
 
-        normalized = dict(data)
-        storage_value = normalized.get("storage")
+        storage_value = data.get("storage")
         if not isinstance(storage_value, dict):
-            return normalized
-        storage = dict(storage_value)
-        agfs_value = storage.get("agfs")
+            return data
+        agfs_value = storage_value.get("agfs")
         if not isinstance(agfs_value, dict):
-            return normalized
-        agfs = dict(agfs_value)
-
-        cache_value = normalized.get("cache")
-        canonical_cache = dict(cache_value) if isinstance(cache_value, dict) else None
-
-        def normalize_redis_params(params: Dict[str, Any]) -> Dict[str, Any]:
-            normalized_params = dict(params)
-            replica_reads = normalized_params.pop("read_from_replica", None)
-            if replica_reads:
-                _get_config_warning_logger().warning(
-                    "Redis read_from_replica is no longer supported; all CacheRuntime reads use the primary"
-                )
-            tls_enabled = normalized_params.pop("tls_enabled", None)
-            if tls_enabled:
-                endpoints = normalized_params.get(
-                    "endpoints", ["redis://127.0.0.1:6379"]
-                )
-                normalized_params["endpoints"] = [
-                    endpoint.replace("redis://", "rediss://", 1)
-                    if endpoint.startswith("redis://")
-                    else endpoint
-                    for endpoint in endpoints
-                ]
-            return normalized_params
-
-        def merge_provider(provider: str, params: Dict[str, Any], source: str) -> None:
-            nonlocal canonical_cache
-            if canonical_cache is None:
-                canonical_cache = {"provider": provider, "params": dict(params)}
-                return
-            if canonical_cache.get("provider") != provider:
-                raise ValueError(f"{source} conflicts with top-level cache provider")
-            existing_params = canonical_cache.get("params", {})
-            if not isinstance(existing_params, dict):
-                raise ValueError("top-level cache params must be an object")
-            merged_params = dict(existing_params)
-            for key, value in params.items():
-                if key in merged_params and merged_params[key] != value:
-                    raise ValueError(f"{source} conflicts with top-level cache params: {key}")
-                merged_params.setdefault(key, value)
-            canonical_cache["params"] = merged_params
-
-        legacy_cache = agfs.pop("cache", None)
-        if isinstance(legacy_cache, dict):
-            cachefs_value = agfs.get("cachefs")
-            cachefs = dict(cachefs_value) if isinstance(cachefs_value, dict) else {}
-            cachefs.setdefault(
-                "backend", "cache" if legacy_cache.get("enabled", False) else "local"
+            return data
+        if "cache" in agfs_value:
+            raise ValueError(
+                "storage.agfs.cache has been removed; configure cache.provider/cache.params "
+                "and storage.agfs.cachefs.backend='cache'"
             )
-            for field in (
-                "namespace",
-                "max_file_size_bytes",
-                "traversal_mode",
-                "bypass_prefixes",
-            ):
-                if field in legacy_cache:
-                    cachefs.setdefault(field, legacy_cache[field])
-            agfs["cachefs"] = cachefs
-
-            provider = str(legacy_cache.get("provider", "redis"))
-            provider_params = legacy_cache.get(provider, {})
-            provider_was_configured = (
-                bool(legacy_cache.get("enabled", False))
-                or "provider" in legacy_cache
-                or provider in legacy_cache
+        queuefs = agfs_value.get("queuefs")
+        if isinstance(queuefs, dict) and (
+            queuefs.get("backend") == "redis" or "redis" in queuefs
+        ):
+            raise ValueError(
+                "storage.agfs.queuefs backend='redis' and queuefs.redis have been removed; "
+                "use backend='cache' with top-level cache.provider/cache.params"
             )
-            if provider_was_configured:
-                if not isinstance(provider_params, dict):
-                    raise ValueError(f"storage.agfs.cache.{provider} must be an object")
-                provider_params = dict(provider_params)
-                if provider == "redis":
-                    key_prefix = provider_params.pop("key_prefix", "").rstrip(":")
-                    if key_prefix:
-                        cachefs["namespace"] = (
-                            f"{key_prefix}:{cachefs.get('namespace', 'openviking')}"
-                        )
-                        agfs["cachefs"] = cachefs
-                merge_provider(provider, provider_params, "storage.agfs.cache")
-
-        queuefs_value = agfs.get("queuefs")
-        if isinstance(queuefs_value, dict) and queuefs_value.get("backend") == "redis":
-            queuefs = dict(queuefs_value)
-            redis_value = queuefs.pop("redis", {})
-            if not isinstance(redis_value, dict):
-                raise ValueError("storage.agfs.queuefs.redis must be an object")
-            redis_params = dict(redis_value)
-            key_prefix = redis_params.pop("key_prefix", None)
-            redis_params.setdefault("connect_timeout_ms", 3000)
-            redis_params.setdefault("command_timeout_ms", 3000)
-            if redis_params.get("mode") == "singleton":
-                redis_params["mode"] = "standalone"
-            merge_provider("redis", redis_params, "storage.agfs.queuefs.redis")
-            queuefs["backend"] = "cache"
-            if key_prefix is not None:
-                queuefs.setdefault("cache_key_prefix", key_prefix)
-            agfs["queuefs"] = queuefs
-
-        if canonical_cache is not None:
-            if canonical_cache.get("provider") == "redis":
-                params = canonical_cache.get("params", {})
-                if not isinstance(params, dict):
-                    raise ValueError("top-level cache params must be an object")
-                canonical_cache["params"] = normalize_redis_params(params)
-            normalized["cache"] = canonical_cache
-        storage["agfs"] = agfs
-        normalized["storage"] = storage
-        return normalized
+        return data
 
     allow_private_networks: bool = Field(
         default=False,

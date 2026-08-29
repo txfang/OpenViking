@@ -154,7 +154,6 @@ mod tests {
             .unwrap();
         let config = RedisProviderConfig {
             endpoints: vec![endpoint],
-            key_prefix: String::new(),
             command_timeout_ms: 1_000,
             ..RedisProviderConfig::default()
         };
@@ -199,7 +198,6 @@ mod tests {
             .unwrap();
         let config = RedisProviderConfig {
             endpoints: vec![endpoint],
-            key_prefix: String::new(),
             command_timeout_ms: 1_000,
             ..RedisProviderConfig::default()
         };

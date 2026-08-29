@@ -44,8 +44,6 @@ pub struct RedisProviderConfig {
     pub connect_timeout_ms: u64,
     /// Command timeout in milliseconds.
     pub command_timeout_ms: u64,
-    /// Reserved compatibility field; unified Runtime keys require this to be empty.
-    pub key_prefix: String,
     /// Default TTL in seconds; zero disables expiration.
     pub default_ttl_seconds: u64,
     /// Disable certificate verification for `rediss://` endpoints.
@@ -68,7 +66,6 @@ impl Default for RedisProviderConfig {
             pool_size: 32,
             connect_timeout_ms: 1_000,
             command_timeout_ms: 20,
-            key_prefix: String::new(),
             default_ttl_seconds: 3_600,
             tls_insecure_skip_verify: false,
         }
@@ -79,7 +76,7 @@ impl RedisProviderConfig {
     /// Normalize the configured deployment mode.
     pub fn deployment_mode(&self) -> CacheResult<RedisDeploymentMode> {
         match self.mode.trim().to_ascii_lowercase().as_str() {
-            "standalone" | "singleton" => Ok(RedisDeploymentMode::Standalone),
+            "standalone" => Ok(RedisDeploymentMode::Standalone),
             "cluster" => Ok(RedisDeploymentMode::Cluster),
             "sentinel" => Ok(RedisDeploymentMode::Sentinel),
             other => Err(CacheError::InvalidArgument(format!(
@@ -134,12 +131,6 @@ impl RedisProviderConfig {
         if self.connect_timeout_ms == 0 || self.command_timeout_ms == 0 {
             return Err(CacheError::InvalidArgument(
                 "Redis timeouts must be greater than zero".into(),
-            ));
-        }
-        if !self.key_prefix.is_empty() {
-            return Err(CacheError::InvalidArgument(
-                "Redis provider key_prefix must be empty because Runtime keys are fully qualified"
-                    .into(),
             ));
         }
         if self.default_ttl_seconds.checked_mul(1_000).is_none() {
@@ -203,7 +194,6 @@ impl fmt::Debug for RedisProviderConfig {
             .field("pool_size", &self.pool_size)
             .field("connect_timeout_ms", &self.connect_timeout_ms)
             .field("command_timeout_ms", &self.command_timeout_ms)
-            .field("key_prefix", &self.key_prefix)
             .field("default_ttl_seconds", &self.default_ttl_seconds)
             .field("tls_insecure_skip_verify", &self.tls_insecure_skip_verify)
             .finish()
@@ -288,17 +278,17 @@ mod tests {
     }
 
     #[test]
-    fn singleton_is_a_legacy_alias_for_standalone() {
+    fn rejects_removed_singleton_mode() {
         let config = RedisProviderConfig {
             mode: "singleton".into(),
             ..RedisProviderConfig::default()
         };
 
-        assert_eq!(
-            config.deployment_mode().unwrap(),
-            RedisDeploymentMode::Standalone
-        );
-        config.validate().unwrap();
+        assert!(matches!(
+            config.validate(),
+            Err(CacheError::InvalidArgument(message))
+                if message.contains("standalone, cluster, or sentinel")
+        ));
     }
 
     #[test]
@@ -387,19 +377,6 @@ mod tests {
         assert!(matches!(
             config.validate(),
             Err(CacheError::InvalidArgument(message)) if message.contains("TTL")
-        ));
-    }
-
-    #[test]
-    fn rejects_provider_key_prefix_because_runtime_keys_are_fully_qualified() {
-        let config = RedisProviderConfig {
-            key_prefix: "provider-prefix".into(),
-            ..RedisProviderConfig::default()
-        };
-
-        assert!(matches!(
-            config.validate(),
-            Err(CacheError::InvalidArgument(message)) if message.contains("key_prefix")
         ));
     }
 

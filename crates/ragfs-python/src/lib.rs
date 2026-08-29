@@ -209,7 +209,7 @@ fn validate_expire_secs(v: f64) -> PyResult<f64> {
 }
 
 use ragfs::cache::{CachePolicy, CacheTraversalMode};
-use ragfs::cache_runtime::{DynamicProviderConfig, RedisProviderConfig};
+use ragfs::cache_runtime::{CacheRuntime, DynamicProviderConfig, RedisProviderConfig};
 use ragfs::core::builder::{
     CacheFsConfig, CacheRuntimeProviderConfig, CacheStackConfig, EncryptionConfig,
 };
@@ -297,7 +297,6 @@ struct RedisCacheConfig {
     pool_size: usize,
     connect_timeout_ms: u64,
     command_timeout_ms: u64,
-    key_prefix: String,
     default_ttl_seconds: u64,
     tls_insecure_skip_verify: bool,
 }
@@ -343,7 +342,6 @@ impl Default for RedisCacheConfig {
             pool_size: 32,
             connect_timeout_ms: 1_000,
             command_timeout_ms: 20,
-            key_prefix: String::new(),
             default_ttl_seconds: 3_600,
             tls_insecure_skip_verify: false,
         }
@@ -370,7 +368,6 @@ impl RagfsCacheConfig {
                 pool_size: self.redis.pool_size,
                 connect_timeout_ms: self.redis.connect_timeout_ms,
                 command_timeout_ms: self.redis.command_timeout_ms,
-                key_prefix: self.redis.key_prefix.clone(),
                 default_ttl_seconds: self.redis.default_ttl_seconds,
                 tls_insecure_skip_verify: self.redis.tls_insecure_skip_verify,
             }),
@@ -398,201 +395,111 @@ fn cache_config_from_ov_conf(path: &str) -> Result<RagfsCacheConfig, String> {
         .map_err(|error| format!("failed to read OpenViking config {path}: {error}"))?;
     let json: serde_json::Value = serde_json::from_str(&raw)
         .map_err(|error| format!("failed to parse OpenViking config {path}: {error}"))?;
+    cache_config_from_canonical_ov_conf(&json)
+}
 
+fn cache_config_from_canonical_ov_conf(
+    json: &serde_json::Value,
+) -> Result<RagfsCacheConfig, String> {
     let agfs = json.get("storage").and_then(|storage| storage.get("agfs"));
-    let configured_provider = agfs
-        .and_then(|agfs| agfs.get("cache"))
-        .and_then(|cache| cache.get("provider"))
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("redis");
+    if agfs.and_then(|agfs| agfs.get("cache")).is_some() {
+        return Err(
+            "storage.agfs.cache has been removed; use cache.provider/cache.params and ".to_string()
+                + "storage.agfs.cachefs.backend=cache",
+        );
+    }
 
-    let mut config = match agfs.and_then(|agfs| agfs.get("cache")) {
-        Some(cache) => cache_config_from_value(cache),
-        None => Ok(RagfsCacheConfig::default()),
-    }?;
-    let queuefs_backend = agfs
-        .and_then(|agfs| agfs.get("queuefs"))
-        .and_then(|queuefs| queuefs.get("backend"))
-        .and_then(serde_json::Value::as_str);
-    match queuefs_backend {
-        Some("cache") => {
-            config.runtime_enabled = true;
-            config.provider = provider_kind(configured_provider.to_string())?;
+    let queuefs = agfs.and_then(|agfs| agfs.get("queuefs"));
+    if queuefs.and_then(|queuefs| queuefs.get("redis")).is_some() {
+        return Err(
+            "storage.agfs.queuefs.redis has been removed; use queuefs backend=cache with "
+                .to_string()
+                + "cache.provider/cache.params",
+        );
+    }
+    let queuefs_backend = optional_backend(queuefs, "storage.agfs.queuefs", "sqlite")?;
+    if queuefs_backend == "redis" {
+        return Err(
+            "queuefs backend=redis has been removed; use backend=cache with ".to_string()
+                + "cache.provider/cache.params",
+        );
+    }
+
+    let cachefs = agfs.and_then(|agfs| agfs.get("cachefs"));
+    let cachefs_backend = optional_backend(cachefs, "storage.agfs.cachefs", "local")?;
+    if !matches!(cachefs_backend.as_str(), "local" | "cache") {
+        return Err(format!(
+            "unsupported storage.agfs.cachefs.backend: {cachefs_backend}; expected local or cache"
+        ));
+    }
+
+    let mut config = RagfsCacheConfig::default();
+    config.enabled = cachefs_backend == "cache";
+    config.runtime_enabled = config.enabled || queuefs_backend == "cache";
+    if let Some(cachefs) = cachefs {
+        let cachefs = cachefs
+            .as_object()
+            .ok_or_else(|| "storage.agfs.cachefs must be an object".to_string())?;
+        config.namespace = string_field(cachefs, "namespace", &config.namespace)?;
+        config.max_file_size_bytes =
+            usize_field(cachefs, "max_file_size_bytes", config.max_file_size_bytes)?;
+        config.traversal_mode =
+            traversal_mode(string_field(cachefs, "traversal_mode", "backend")?)?;
+        config.bypass_prefixes = string_array_field(cachefs, "bypass_prefixes")?;
+    }
+
+    if !config.runtime_enabled {
+        return Ok(config);
+    }
+    let cache = json
+        .get("cache")
+        .ok_or_else(|| {
+            "top-level cache.provider/cache.params is required when CacheFS or QueueFS uses backend=cache"
+                .to_string()
+        })?
+        .as_object()
+        .ok_or_else(|| "top-level cache must be an object".to_string())?;
+    let provider = cache
+        .get("provider")
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| "top-level cache.provider must be a string".to_string())?;
+    let params = cache
+        .get("params")
+        .map(|params| {
+            params
+                .as_object()
+                .ok_or_else(|| "top-level cache.params must be an object".to_string())
+        })
+        .transpose()?
+        .cloned()
+        .unwrap_or_default();
+    config.provider = provider_kind(provider.to_string())?;
+    match config.provider {
+        CacheProviderKind::Redis => parse_redis_config(&mut config.redis, &params, "cache.params")?,
+        CacheProviderKind::Dynamic => {
+            config.dynamic.library = string_field(&params, "library", "")?;
+            config.dynamic.params = params
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
         }
-        Some("redis") => {
-            if configured_provider != "redis"
-                && agfs
-                    .and_then(|agfs| agfs.get("cache"))
-                    .and_then(serde_json::Value::as_object)
-                    .is_some_and(|cache| cache.contains_key("provider"))
-            {
-                return Err(
-                    "queuefs backend=redis conflicts with the global cache provider".to_string(),
-                );
-            }
-            config.runtime_enabled = true;
-            config.provider = CacheProviderKind::Redis;
-            merge_legacy_queuefs_redis_config(&mut config, agfs)?;
-        }
-        _ => {}
     }
     validate_cache_runtime_config(&config)?;
     Ok(config)
 }
 
-fn merge_legacy_queuefs_redis_config(
-    config: &mut RagfsCacheConfig,
-    agfs: Option<&serde_json::Value>,
-) -> Result<(), String> {
-    let cache_redis = agfs
-        .and_then(|agfs| agfs.get("cache"))
-        .and_then(|cache| cache.get("redis"))
-        .and_then(serde_json::Value::as_object);
-    let legacy_redis = agfs
-        .and_then(|agfs| agfs.get("queuefs"))
-        .and_then(|queuefs| queuefs.get("redis"))
-        .map(|redis| {
-            redis
-                .as_object()
-                .ok_or_else(|| "storage.agfs.queuefs.redis must be an object".to_string())
-        })
-        .transpose()?;
-    let empty = serde_json::Map::new();
-    let legacy_redis = legacy_redis.unwrap_or(&empty);
-
-    let legacy_mode = match string_field(legacy_redis, "mode", "singleton")?.as_str() {
-        "singleton" => "standalone".to_string(),
-        value => value.to_string(),
+fn optional_backend(
+    section: Option<&serde_json::Value>,
+    name: &str,
+    default: &str,
+) -> Result<String, String> {
+    let Some(section) = section else {
+        return Ok(default.to_string());
     };
-    let current_mode = match config.redis.mode.as_str() {
-        "singleton" => "standalone",
-        value => value,
-    };
-    if merge_legacy_field(
-        "mode",
-        cache_redis,
-        legacy_redis,
-        current_mode == legacy_mode,
-    )? {
-        config.redis.mode = legacy_mode;
-    }
-
-    let legacy_tls_enabled = bool_field(legacy_redis, "tls_enabled", false)?;
-    let mut legacy_endpoints = string_array_field_or_default(
-        legacy_redis,
-        "endpoints",
-        &["redis://127.0.0.1:6379".to_string()],
-    )?;
-    if legacy_tls_enabled {
-        legacy_endpoints = enable_tls_for_endpoints(legacy_endpoints);
-    }
-    let global_transport_explicit = cache_redis
-        .is_some_and(|redis| redis.contains_key("endpoints") || redis.contains_key("tls_enabled"));
-    let legacy_transport_explicit =
-        legacy_redis.contains_key("endpoints") || legacy_redis.contains_key("tls_enabled");
-    if global_transport_explicit
-        && legacy_transport_explicit
-        && config.redis.endpoints != legacy_endpoints
-    {
-        return Err("conflicting Redis setting: endpoints".to_string());
-    }
-    if legacy_transport_explicit || !global_transport_explicit {
-        config.redis.endpoints = legacy_endpoints;
-    }
-
-    let legacy_master_name = optional_string_field(legacy_redis, "master_name")?;
-    if merge_legacy_field(
-        "master_name",
-        cache_redis,
-        legacy_redis,
-        config.redis.master_name == legacy_master_name,
-    )? {
-        config.redis.master_name = legacy_master_name;
-    }
-
-    macro_rules! merge_string {
-        ($field:ident) => {{
-            let value =
-                optional_string_field(legacy_redis, stringify!($field))?.unwrap_or_default();
-            if merge_legacy_field(
-                stringify!($field),
-                cache_redis,
-                legacy_redis,
-                config.redis.$field == value,
-            )? {
-                config.redis.$field = value;
-            }
-        }};
-    }
-    merge_string!(username);
-    merge_string!(password);
-    merge_string!(sentinel_username);
-    merge_string!(sentinel_password);
-
-    macro_rules! merge_i64 {
-        ($field:ident, $default:expr) => {{
-            let value = i64_field(legacy_redis, stringify!($field), $default)?;
-            if merge_legacy_field(
-                stringify!($field),
-                cache_redis,
-                legacy_redis,
-                config.redis.$field == value,
-            )? {
-                config.redis.$field = value;
-            }
-        }};
-    }
-    merge_i64!(db, 0);
-
-    macro_rules! merge_u64 {
-        ($field:ident, $default:expr) => {{
-            let value = u64_field(legacy_redis, stringify!($field), $default)?;
-            if merge_legacy_field(
-                stringify!($field),
-                cache_redis,
-                legacy_redis,
-                config.redis.$field == value,
-            )? {
-                config.redis.$field = value;
-            }
-        }};
-    }
-    merge_u64!(connect_timeout_ms, 3_000);
-    merge_u64!(command_timeout_ms, 3_000);
-
-    let tls_insecure_skip_verify = bool_field(legacy_redis, "tls_insecure_skip_verify", false)?;
-    if merge_legacy_field(
-        "tls_insecure_skip_verify",
-        cache_redis,
-        legacy_redis,
-        config.redis.tls_insecure_skip_verify == tls_insecure_skip_verify,
-    )? {
-        config.redis.tls_insecure_skip_verify = tls_insecure_skip_verify;
-    }
-
-    if !config.redis.password.is_empty() && !config.redis.password_env.is_empty() {
-        return Err("conflicting Redis setting: password".to_string());
-    }
-    if !config.redis.sentinel_password.is_empty() && !config.redis.sentinel_password_env.is_empty()
-    {
-        return Err("conflicting Redis setting: sentinel_password".to_string());
-    }
-    Ok(())
-}
-
-fn merge_legacy_field(
-    field: &str,
-    global: Option<&serde_json::Map<String, serde_json::Value>>,
-    legacy: &serde_json::Map<String, serde_json::Value>,
-    values_match: bool,
-) -> Result<bool, String> {
-    let global_explicit = global.is_some_and(|global| global.contains_key(field));
-    let legacy_explicit = legacy.contains_key(field);
-    if global_explicit && legacy_explicit && !values_match {
-        Err(format!("conflicting Redis setting: {field}"))
-    } else {
-        Ok(legacy_explicit || !global_explicit)
-    }
+    let section = section
+        .as_object()
+        .ok_or_else(|| format!("{name} must be an object"))?;
+    string_field(section, "backend", default)
 }
 
 fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig, String> {
@@ -601,23 +508,16 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
     }
     let cache = cache
         .as_object()
-        .ok_or_else(|| "storage.agfs.cache must be an object".to_string())?;
+        .ok_or_else(|| "binding cache config must be an object".to_string())?;
 
     let mut config = RagfsCacheConfig::default();
     config.enabled = bool_field(cache, "enabled", config.enabled)?;
     config.runtime_enabled = bool_field(cache, "runtime_enabled", config.enabled)?;
     let provider = string_field(cache, "provider", "redis")?;
-    config.provider = if config.enabled || config.runtime_enabled {
-        provider_kind(provider)?
-    } else {
-        match provider.as_str() {
-            "memory" | "yuanrong" | "mooncake" => CacheProviderKind::Redis,
-            _ => provider_kind(provider)?,
-        }
-    };
+    config.provider = provider_kind(provider)?;
     config.namespace = string_field(cache, "namespace", &config.namespace)?;
     if config.namespace.trim().is_empty() {
-        return Err("storage.agfs.cache.namespace must not be empty".to_string());
+        return Err("cache.namespace must not be empty".to_string());
     }
     config.max_file_size_bytes =
         usize_field(cache, "max_file_size_bytes", config.max_file_size_bytes)?;
@@ -627,77 +527,74 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
     if let Some(redis) = cache.get("redis") {
         let redis = redis
             .as_object()
-            .ok_or_else(|| "storage.agfs.cache.redis must be an object".to_string())?;
-        config.redis.mode = string_field(redis, "mode", &config.redis.mode)?;
-        config.redis.endpoints =
-            string_array_field_or_default(redis, "endpoints", &config.redis.endpoints)?;
-        config.redis.master_name = optional_string_field(redis, "master_name")?;
-        config.redis.username = string_field(redis, "username", &config.redis.username)?;
-        config.redis.password_env =
-            string_field(redis, "password_env", &config.redis.password_env)?;
-        config.redis.password = string_field(redis, "password", &config.redis.password)?;
-        config.redis.sentinel_username =
-            string_field(redis, "sentinel_username", &config.redis.sentinel_username)?;
-        config.redis.sentinel_password_env = string_field(
-            redis,
-            "sentinel_password_env",
-            &config.redis.sentinel_password_env,
-        )?;
-        config.redis.sentinel_password =
-            string_field(redis, "sentinel_password", &config.redis.sentinel_password)?;
-        config.redis.db = i64_field(redis, "db", config.redis.db)?;
-        config.redis.pool_size = usize_field(redis, "pool_size", config.redis.pool_size)?;
-        config.redis.connect_timeout_ms =
-            u64_field(redis, "connect_timeout_ms", config.redis.connect_timeout_ms)?;
-        config.redis.command_timeout_ms =
-            u64_field(redis, "command_timeout_ms", config.redis.command_timeout_ms)?;
-        config.redis.key_prefix = string_field(redis, "key_prefix", &config.redis.key_prefix)?;
-        config.redis.default_ttl_seconds = u64_field_allow_zero(
-            redis,
-            "default_ttl_seconds",
-            config.redis.default_ttl_seconds,
-        )?;
-        let _ = bool_field(redis, "read_from_replica", false)?;
-        if bool_field(redis, "tls_enabled", false)? {
-            config.redis.endpoints = enable_tls_for_endpoints(config.redis.endpoints);
-        }
-        config.redis.tls_insecure_skip_verify = bool_field(
-            redis,
-            "tls_insecure_skip_verify",
-            config.redis.tls_insecure_skip_verify,
-        )?;
+            .ok_or_else(|| "cache.redis must be an object".to_string())?;
+        parse_redis_config(&mut config.redis, redis, "cache.redis")?;
     }
 
     if let Some(dynamic) = cache.get("dynamic") {
         let dynamic = dynamic
             .as_object()
-            .ok_or_else(|| "storage.agfs.cache.dynamic must be an object".to_string())?;
+            .ok_or_else(|| "cache.dynamic must be an object".to_string())?;
         config.dynamic.library = string_field(dynamic, "library", &config.dynamic.library)?;
         config.dynamic.params = dynamic
             .get("params")
             .cloned()
             .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
     }
-    if config.enabled && !config.redis.key_prefix.is_empty() {
-        let key_prefix = config.redis.key_prefix.trim_matches(':');
-        if !key_prefix.is_empty() {
-            config.namespace = format!("{key_prefix}:{}", config.namespace);
-        }
-        config.redis.key_prefix.clear();
-    }
     validate_cache_runtime_config(&config)?;
     Ok(config)
 }
 
-fn enable_tls_for_endpoints(endpoints: Vec<String>) -> Vec<String> {
-    endpoints
-        .into_iter()
-        .map(|endpoint| {
-            endpoint
-                .strip_prefix("redis://")
-                .map_or(endpoint.clone(), |rest| format!("rediss://{rest}"))
-        })
-        .collect()
+fn parse_redis_config(
+    config: &mut RedisCacheConfig,
+    redis: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Result<(), String> {
+    const FIELDS: &[&str] = &[
+        "mode",
+        "endpoints",
+        "master_name",
+        "username",
+        "password_env",
+        "password",
+        "sentinel_username",
+        "sentinel_password_env",
+        "sentinel_password",
+        "db",
+        "pool_size",
+        "connect_timeout_ms",
+        "command_timeout_ms",
+        "default_ttl_seconds",
+        "tls_insecure_skip_verify",
+    ];
+    if let Some(field) = redis.keys().find(|field| !FIELDS.contains(&field.as_str())) {
+        return Err(format!("unsupported {name} field: {field}"));
+    }
+    config.mode = string_field(redis, "mode", &config.mode)?;
+    config.endpoints = string_array_field_or_default(redis, "endpoints", &config.endpoints)?;
+    config.master_name = optional_string_field(redis, "master_name")?;
+    config.username = string_field(redis, "username", &config.username)?;
+    config.password_env = string_field(redis, "password_env", &config.password_env)?;
+    config.password = string_field(redis, "password", &config.password)?;
+    config.sentinel_username = string_field(redis, "sentinel_username", &config.sentinel_username)?;
+    config.sentinel_password_env = string_field(
+        redis,
+        "sentinel_password_env",
+        &config.sentinel_password_env,
+    )?;
+    config.sentinel_password = string_field(redis, "sentinel_password", &config.sentinel_password)?;
+    config.db = i64_field(redis, "db", config.db)?;
+    config.pool_size = usize_field(redis, "pool_size", config.pool_size)?;
+    config.connect_timeout_ms = u64_field(redis, "connect_timeout_ms", config.connect_timeout_ms)?;
+    config.command_timeout_ms = u64_field(redis, "command_timeout_ms", config.command_timeout_ms)?;
+    config.default_ttl_seconds =
+        u64_field_allow_zero(redis, "default_ttl_seconds", config.default_ttl_seconds)?;
+    config.tls_insecure_skip_verify = bool_field(
+        redis,
+        "tls_insecure_skip_verify",
+        config.tls_insecure_skip_verify,
+    )?;
+    Ok(())
 }
 
 fn validate_cache_runtime_config(config: &RagfsCacheConfig) -> Result<(), String> {
@@ -707,16 +604,7 @@ fn validate_cache_runtime_config(config: &RagfsCacheConfig) -> Result<(), String
     if matches!(config.provider, CacheProviderKind::Dynamic)
         && config.dynamic.library.trim().is_empty()
     {
-        return Err("storage.agfs.cache.dynamic.library must not be empty".to_string());
-    }
-    if config.runtime_enabled
-        && matches!(config.provider, CacheProviderKind::Redis)
-        && !config.redis.key_prefix.is_empty()
-    {
-        return Err(
-            "storage.agfs.cache.redis.key_prefix must be empty when QueueFS uses backend=cache"
-                .to_string(),
-        );
+        return Err("cache dynamic provider library must not be empty".to_string());
     }
     Ok(())
 }
@@ -726,7 +614,7 @@ fn provider_kind(value: String) -> Result<CacheProviderKind, String> {
         "redis" => Ok(CacheProviderKind::Redis),
         "dynamic" => Ok(CacheProviderKind::Dynamic),
         other => Err(format!(
-            "unsupported storage.agfs.cache.provider: {other}; expected redis or dynamic"
+            "unsupported cache.provider: {other}; expected redis or dynamic"
         )),
     }
 }
@@ -736,7 +624,7 @@ fn traversal_mode(value: String) -> Result<CacheTraversalMode, String> {
         "backend" => Ok(CacheTraversalMode::Backend),
         "cached_traversal" => Ok(CacheTraversalMode::CachedTraversal),
         other => Err(format!(
-            "unsupported storage.agfs.cache.traversal_mode: {other}; expected backend or cached_traversal"
+            "unsupported cachefs.traversal_mode: {other}; expected backend or cached_traversal"
         )),
     }
 }
@@ -1362,6 +1250,8 @@ struct RAGFSBindingClient {
     git_backend: Option<String>,
     /// PathLock manager. OpenViking always builds ragfs with PathLock enabled.
     pathlock_manager: Arc<PathLockManager>,
+    /// Shared cache runtime. Closed only after mounted QueueFS instances shut down.
+    cache_runtime: Option<Arc<CacheRuntime>>,
 }
 
 impl RAGFSBindingClient {
@@ -1391,11 +1281,11 @@ impl RAGFSBindingClient {
 impl RAGFSBindingClient {
     /// Create a new RAGFS binding client.
     ///
-    /// `config_path` is a deprecated compatibility parameter kept only so legacy callers using
-    /// `RAGFSBindingClient(config_path=...)` do not fail. `config` is an optional sectioned dict
-    /// (mirrors ov.conf). The `encryption` section, when present, carries `root_key` (32 bytes) +
-    /// `provider_type` (int) and causes the stack to include an `EncryptionWrappedFS` layer.
-    /// Runtime `cache` configuration takes precedence over `config_path`.
+    /// `config_path` loads the canonical ov.conf schema. Removed cache schemas are rejected.
+    /// `config` is an optional sectioned dict produced by the Python runtime. The `encryption`
+    /// section, when present, carries `root_key` (32 bytes) + `provider_type` (int) and causes the
+    /// stack to include an `EncryptionWrappedFS` layer. Runtime `cache` configuration takes
+    /// precedence over `config_path`.
     #[new]
     #[pyo3(signature = (config_path=None, config=None, git_config_path=None))]
     fn new(
@@ -1490,15 +1380,13 @@ impl RAGFSBindingClient {
             }
         }
 
-        let cache_config = match runtime_cache_config {
-            Some(config) => config,
-            None => match config_path {
-                Some(path) => cache_config_from_ov_conf(path).map_err(|error| {
-                    PyRuntimeError::new_err(format!("Invalid cache config: {error}"))
-                })?,
-                None => RagfsCacheConfig::default(),
-            },
-        };
+        let file_cache_config = config_path
+            .map(cache_config_from_ov_conf)
+            .transpose()
+            .map_err(|error| PyRuntimeError::new_err(format!("Invalid cache config: {error}")))?;
+        let cache_config = runtime_cache_config
+            .or(file_cache_config)
+            .unwrap_or_default();
 
         // Phase B: RAGFS owns Runtime construction and injects the same instance
         // into CacheFS and QueueFS. The binding only translates configuration.
@@ -1528,6 +1416,24 @@ impl RAGFSBindingClient {
             git_service,
             git_backend,
             pathlock_manager: stack.pathlock_manager,
+            cache_runtime: stack.cache_runtime,
+        })
+    }
+
+    /// Stop mounted background services, then close the shared CacheRuntime.
+    fn close(&self, py: Python<'_>) -> PyResult<()> {
+        let mountable = Arc::clone(&self.mountable);
+        let cache_runtime = self.cache_runtime.clone();
+        py_detach_blocking(py, || {
+            self.rt.block_on(async move {
+                let mount_result = mountable.shutdown().await;
+                let cache_result = match cache_runtime {
+                    Some(runtime) => runtime.close().await.map_err(|error| error.to_string()),
+                    None => Ok(()),
+                };
+                mount_result.map_err(|error| PyRuntimeError::new_err(error.to_string()))?;
+                cache_result.map_err(PyRuntimeError::new_err)
+            })
         })
     }
 
@@ -2938,9 +2844,9 @@ mod tests {
     }
 
     #[test]
-    fn constructor_accepts_legacy_config_path_keyword() {
+    fn constructor_accepts_canonical_config_path() {
         let path = std::env::temp_dir().join(format!(
-            "openviking-legacy-config-path-{}.json",
+            "openviking-canonical-config-path-{}.json",
             std::process::id()
         ));
         fs::write(&path, r#"{"storage": {"agfs": {"backend": "local"}}}"#).unwrap();
@@ -3009,17 +2915,19 @@ mod tests {
         fs::write(
             &path,
             r#"{
+                "cache": {
+                    "provider": "dynamic",
+                    "params": {
+                        "library": "/opt/openviking/libprovider.so",
+                        "params": {"endpoint": "provider:1234"}
+                    }
+                },
                 "storage": {
                     "agfs": {
-                        "cache": {
-                            "enabled": true,
-                            "provider": "dynamic",
+                        "cachefs": {
+                            "backend": "cache",
                             "namespace": "ov-test",
-                            "traversal_mode": "cached_traversal",
-                            "dynamic": {
-                                "library": "/opt/openviking/libprovider.so",
-                                "params": {"endpoint": "provider:1234"}
-                            }
+                            "traversal_mode": "cached_traversal"
                         }
                     }
                 }
@@ -3062,6 +2970,91 @@ mod tests {
     }
 
     #[test]
+    fn canonical_cache_config_is_parsed_from_ov_conf() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-canonical-cache-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{
+                "cache": {
+                    "provider": "redis",
+                    "params": {
+                        "mode": "sentinel",
+                        "endpoints": ["redis://sentinel:26379"],
+                        "master_name": "mymaster",
+                        "command_timeout_ms": 750
+                    }
+                },
+                "storage": {
+                    "agfs": {
+                        "cachefs": {
+                            "backend": "cache",
+                            "namespace": "tenant-a",
+                            "traversal_mode": "cached_traversal"
+                        },
+                        "queuefs": {"backend": "cache"}
+                    }
+                }
+            }"#,
+        )
+        .unwrap();
+
+        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+
+        assert!(cache_config.enabled);
+        assert!(cache_config.runtime_enabled);
+        assert_eq!(cache_config.provider, CacheProviderKind::Redis);
+        assert_eq!(cache_config.namespace, "tenant-a");
+        assert_eq!(
+            cache_config.traversal_mode,
+            CacheTraversalMode::CachedTraversal
+        );
+        assert_eq!(cache_config.redis.mode, "sentinel");
+        assert_eq!(cache_config.redis.master_name.as_deref(), Some("mymaster"));
+        assert_eq!(cache_config.redis.command_timeout_ms, 750);
+
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn config_path_rejects_removed_nested_cache_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-removed-cache-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(&path, r#"{"storage":{"agfs":{"cache":{"enabled":true}}}}"#).unwrap();
+
+        let error = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("storage.agfs.cache has been removed"));
+        assert!(error.contains("cache.provider"));
+        assert!(error.contains("storage.agfs.cachefs.backend"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn config_path_rejects_removed_queuefs_redis_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "openviking-removed-queue-redis-config-{}.json",
+            std::process::id()
+        ));
+        fs::write(
+            &path,
+            r#"{"storage":{"agfs":{"queuefs":{"backend":"redis"}}}}"#,
+        )
+        .unwrap();
+
+        let error = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap_err();
+
+        assert!(error.contains("queuefs backend=redis has been removed"));
+        assert!(error.contains("backend=cache"));
+        assert!(error.contains("cache.params"));
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn queuefs_cache_runtime_does_not_enable_cachefs() {
         let path = std::env::temp_dir().join(format!(
             "openviking-queue-cache-config-{}.json",
@@ -3070,9 +3063,9 @@ mod tests {
         fs::write(
             &path,
             r#"{
+                "cache": {"provider": "redis", "params": {}},
                 "storage": {
                     "agfs": {
-                        "cache": {"enabled": false, "provider": "redis"},
                         "queuefs": {"backend": "cache"}
                     }
                 }
@@ -3090,84 +3083,6 @@ mod tests {
     }
 
     #[test]
-    fn legacy_queuefs_redis_config_initializes_the_shared_runtime() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-legacy-queue-redis-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "queuefs": {
-                            "backend": "redis",
-                            "redis": {
-                                "mode": "singleton",
-                                "endpoints": ["redis://redis.example.com:6379"],
-                                "username": "queue-user",
-                                "password": "legacy-secret",
-                                "db": 2,
-                                "connect_timeout_ms": 1500,
-                                "command_timeout_ms": 2500,
-                                "key_prefix": "tenant-a"
-                            }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
-
-        assert!(cache_config.runtime_enabled);
-        assert!(!cache_config.enabled);
-        assert_eq!(cache_config.provider, CacheProviderKind::Redis);
-        assert_eq!(cache_config.redis.mode, "standalone");
-        assert_eq!(
-            cache_config.redis.endpoints,
-            vec!["redis://redis.example.com:6379"]
-        );
-        assert_eq!(cache_config.redis.username, "queue-user");
-        assert_eq!(cache_config.redis.password, "legacy-secret");
-        assert_eq!(cache_config.redis.db, 2);
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn legacy_queuefs_redis_rejects_conflicting_global_settings() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-conflicting-queue-redis-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "cache": {
-                            "provider": "redis",
-                            "redis": {"endpoints": ["redis://global.example.com:6379"]}
-                        },
-                        "queuefs": {
-                            "backend": "redis",
-                            "redis": {"endpoints": ["redis://legacy.example.com:6379"]}
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let error = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap_err();
-        assert!(error.contains("conflicting Redis setting: endpoints"));
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
     fn queuefs_cache_runtime_rejects_redis_provider_key_prefix() {
         let path = std::env::temp_dir().join(format!(
             "openviking-queue-cache-prefix-config-{}.json",
@@ -3176,13 +3091,12 @@ mod tests {
         fs::write(
             &path,
             r#"{
+                "cache": {
+                    "provider": "redis",
+                    "params": {"key_prefix": "provider-prefix"}
+                },
                 "storage": {
                     "agfs": {
-                        "cache": {
-                            "enabled": false,
-                            "provider": "redis",
-                            "redis": {"key_prefix": "provider-prefix"}
-                        },
                         "queuefs": {"backend": "cache"}
                     }
                 }
@@ -3198,7 +3112,7 @@ mod tests {
     }
 
     #[test]
-    fn queuefs_cache_runtime_rejects_disabled_legacy_provider_name() {
+    fn queuefs_cache_runtime_rejects_unsupported_provider_name() {
         let path = std::env::temp_dir().join(format!(
             "openviking-queue-cache-legacy-provider-{}.json",
             std::process::id()
@@ -3206,9 +3120,9 @@ mod tests {
         fs::write(
             &path,
             r#"{
+                "cache": {"provider": "mooncake", "params": {}},
                 "storage": {
                     "agfs": {
-                        "cache": {"enabled": false, "provider": "mooncake"},
                         "queuefs": {"backend": "cache"}
                     }
                 }
@@ -3224,6 +3138,21 @@ mod tests {
     }
 
     #[test]
+    fn disabled_binding_cache_rejects_removed_provider_names() {
+        for provider in ["memory", "yuanrong", "mooncake"] {
+            let config = serde_json::json!({
+                "enabled": false,
+                "runtime_enabled": false,
+                "provider": provider,
+            });
+
+            let error = cache_config_from_value(&config).unwrap_err();
+
+            assert!(error.contains(provider));
+        }
+    }
+
+    #[test]
     fn cache_config_rejects_invalid_traversal_mode() {
         let path = std::env::temp_dir().join(format!(
             "openviking-invalid-cache-traversal-{}.json",
@@ -3231,7 +3160,13 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"storage": {"agfs": {"cache": {"traversal_mode": "bogus"}}}}"#,
+            r#"{
+                "cache": {"provider": "redis", "params": {}},
+                "storage": {"agfs": {"cachefs": {
+                    "backend": "cache",
+                    "traversal_mode": "bogus"
+                }}}
+            }"#,
         )
         .unwrap();
 
@@ -3251,7 +3186,10 @@ mod tests {
         ));
         fs::write(
             &path,
-            r#"{"storage": {"agfs": {"cache": {"enabled": true, "provider": "invalid"}}}}"#,
+            r#"{
+                "cache": {"provider": "redis", "params": {}},
+                "storage": {"agfs": {"cachefs": {"backend": "cache"}}}
+            }"#,
         )
         .unwrap();
 
@@ -3277,148 +3215,61 @@ mod tests {
     }
 
     #[test]
-    fn redis_cache_config_is_parsed_from_ov_conf() {
+    fn constructor_rejects_removed_config_path_schema_with_runtime_config() {
+        Python::initialize();
         let path = std::env::temp_dir().join(format!(
-            "openviking-redis-cache-config-{}.json",
+            "openviking-removed-runtime-cache-override-{}.json",
             std::process::id()
         ));
         fs::write(
             &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "cache": {
-                            "enabled": true,
-                            "provider": "redis",
-                            "namespace": "ov-test",
-                            "redis": {
-                                "mode": "standalone",
-                                "endpoints": ["redis://127.0.0.1:6379"],
-                                "pool_size": 8,
-                                "connect_timeout_ms": 1000,
-                                "command_timeout_ms": 20,
-                                "key_prefix": "",
-                                "default_ttl_seconds": 3600,
-                                "read_from_replica": true
-                            }
-                        }
-                    }
-                }
-            }"#,
+            r#"{"storage": {"agfs": {"cache": {"enabled": false}}}}"#,
         )
         .unwrap();
 
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+        Python::attach(|py| {
+            let ty = py.get_type::<RAGFSBindingClient>();
+            let cache = PyDict::new(py);
+            cache.set_item("enabled", false).unwrap();
+            cache.set_item("runtime_enabled", false).unwrap();
+            cache.set_item("provider", "redis").unwrap();
+            let config = PyDict::new(py);
+            config.set_item("cache", cache).unwrap();
+            let kwargs = PyDict::new(py);
+            kwargs
+                .set_item("config_path", path.to_str().unwrap())
+                .unwrap();
+            kwargs.set_item("config", config).unwrap();
 
-        assert!(cache_config.enabled);
-        assert_eq!(cache_config.provider, CacheProviderKind::Redis);
-        assert_eq!(cache_config.redis.mode, "standalone");
-        assert_eq!(cache_config.redis.endpoints, vec!["redis://127.0.0.1:6379"]);
-        assert_eq!(cache_config.redis.pool_size, 8);
-        assert_eq!(cache_config.redis.connect_timeout_ms, 1000);
-        assert_eq!(cache_config.redis.command_timeout_ms, 20);
-        assert!(cache_config.redis.key_prefix.is_empty());
-        assert_eq!(cache_config.redis.default_ttl_seconds, 3600);
+            let error = ty.call((), Some(&kwargs)).unwrap_err().to_string();
+            assert!(error.contains("storage.agfs.cache has been removed"));
+        });
 
         fs::remove_file(path).unwrap();
     }
 
     #[test]
-    fn legacy_cache_key_prefix_is_folded_into_the_namespace() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-legacy-cache-prefix-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "cache": {
-                            "enabled": true,
-                            "provider": "redis",
-                            "namespace": "openviking",
-                            "redis": {"key_prefix": "ragfs-cache"}
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
+    fn canonical_config_rejects_removed_redis_fields() {
+        for field in ["key_prefix", "read_from_replica", "tls_enabled"] {
+            let path = std::env::temp_dir().join(format!(
+                "openviking-removed-redis-field-{field}-{}.json",
+                std::process::id()
+            ));
+            fs::write(
+                &path,
+                format!(
+                    r#"{{
+                        "cache": {{"provider": "redis", "params": {{"{field}": true}}}},
+                        "storage": {{"agfs": {{"cachefs": {{"backend": "cache"}}}}}}
+                    }}"#
+                ),
+            )
+            .unwrap();
 
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
+            let error = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap_err();
 
-        assert_eq!(cache_config.namespace, "ragfs-cache:openviking");
-        assert!(cache_config.redis.key_prefix.is_empty());
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn legacy_tls_flag_is_converted_to_rediss_endpoints() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-legacy-cache-tls-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "cache": {
-                            "enabled": true,
-                            "provider": "redis",
-                            "redis": {
-                                "endpoints": ["redis://redis.example.com:6380"],
-                                "tls_enabled": true
-                            }
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
-
-        assert_eq!(
-            cache_config.redis.endpoints,
-            vec!["rediss://redis.example.com:6380"]
-        );
-
-        fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn legacy_queue_defaults_do_not_override_global_tls_transport() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-legacy-shared-tls-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "storage": {
-                    "agfs": {
-                        "cache": {
-                            "enabled": true,
-                            "provider": "redis",
-                            "redis": {"tls_enabled": true}
-                        },
-                        "queuefs": {"backend": "redis"}
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
-
-        assert_eq!(
-            cache_config.redis.endpoints,
-            vec!["rediss://127.0.0.1:6379"]
-        );
-
-        fs::remove_file(path).unwrap();
+            assert!(error.contains(field));
+            fs::remove_file(path).unwrap();
+        }
     }
 }

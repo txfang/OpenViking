@@ -8,7 +8,6 @@ fn config() -> Option<RedisProviderConfig> {
     let endpoint = std::env::var("REDIS_URL").ok()?;
     Some(RedisProviderConfig {
         endpoints: vec![endpoint],
-        key_prefix: String::new(),
         connect_timeout_ms: 30_000,
         command_timeout_ms: 1_000,
         default_ttl_seconds: 60,

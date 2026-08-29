@@ -1194,12 +1194,14 @@ The top-level `cache` section is a sibling of `storage`. Its public shape is Pro
 
 The canonical configuration has no global `cache.enabled`. CacheRuntime is initialized when CacheFS or QueueFS selects `backend=cache`. When all modules use local backends, `cache.params` is not parsed and no Provider connection is opened.
 
+This is a breaking configuration change. `storage.agfs.cache`, `storage.agfs.queuefs.backend="redis"`, and `storage.agfs.queuefs.redis` are rejected. Move Provider settings to top-level `cache.provider/cache.params`, select `cachefs.backend="cache"` or `queuefs.backend="cache"`, use Redis `mode="standalone"` instead of `singleton`, and use `rediss://` instead of `tls_enabled`.
+
 ##### QueueFS Configuration
 
 | Parameter | Type | Description | Default |
 |-----------|------|-------------|---------|
 | `mode` | str | QueueFS namespace mode: `"shared"` uses `/queue`; `"worker"` isolates each worker under `/queue/worker-<index\|pid>` | `"shared"` |
-| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, `"sqlite3"`, or `"cache"`; `"redis"` is a legacy compatibility value | `"sqlite"` |
+| `backend` | str | QueueFS backend: `"memory"`, `"sqlite"`, `"sqlite3"`, or `"cache"` | `"sqlite"` |
 | `db_path` | str (optional) | SQLite database path for QueueFS when backend is `"sqlite"` or `"sqlite3"` | `null` |
 | `recover_stale_sec` | int | Recover `processing` queue messages older than this many seconds on startup. `0` means recover all stale processing messages | `0` |
 | `busy_timeout_ms` | int | SQLite busy timeout for QueueFS in milliseconds | `5000` |

@@ -39,53 +39,22 @@ class RagfsBindingConfig:
         queue_backend = getattr(queuefs, "backend", None)
         cachefs = getattr(self.agfs, "cachefs", None)
         cachefs_backend = getattr(cachefs, "backend", "local")
-        uses_runtime = cachefs_backend == "cache" or queue_backend in {"cache", "redis"}
-        legacy_cache = getattr(self.agfs, "cache", None)
-        legacy_fields_set = set(getattr(legacy_cache, "model_fields_set", set()))
-
-        provider_explicit = False
-        redis_explicit: set[str] = set()
+        uses_runtime = cachefs_backend == "cache" or queue_backend == "cache"
         if self.cache is not None and uses_runtime:
-            if legacy_fields_set:
-                raise ValueError(
-                    "top-level cache config conflicts with deprecated storage.agfs.cache"
-                )
-            cache_config, redis_explicit = _build_provider_cache_config(
+            cache_config = _build_provider_cache_config(
                 self.cache,
                 cachefs,
                 cachefs_backend == "cache",
                 uses_runtime,
             )
-            provider_explicit = True
         elif self.cache is not None:
             cache_config = _disabled_cache_config(cachefs)
         else:
-            cache_config = (
-                legacy_cache.model_dump(mode="json")
-                if legacy_cache is not None
-                else _disabled_cache_config(cachefs)
-            )
-            if cachefs_backend == "cache":
-                if legacy_cache is None or not legacy_fields_set:
-                    raise ValueError(
-                        "top-level cache config is required when cachefs backend=cache"
-                    )
-                cache_config["enabled"] = True
             if uses_runtime:
-                cache_config["runtime_enabled"] = True
-            if legacy_cache is not None:
-                provider_explicit = "provider" in legacy_fields_set
-                legacy_redis = getattr(legacy_cache, "redis", None)
-                redis_explicit = set(getattr(legacy_redis, "model_fields_set", set()))
-
-        if queue_backend == "redis":
-            _merge_legacy_queuefs_redis_config(
-                cache_config,
-                provider=cache_config.get("provider", "redis"),
-                provider_explicit=provider_explicit,
-                redis_explicit=redis_explicit,
-                queuefs_model=queuefs,
-            )
+                raise ValueError(
+                    "top-level cache config is required when CacheFS or QueueFS uses backend=cache"
+                )
+            cache_config = _disabled_cache_config(cachefs)
         binding_config: Dict[str, Any] = {
             "cache": cache_config,
             "pathlock": self.agfs.pathlock.model_dump(mode="json"),
@@ -125,7 +94,7 @@ def _build_provider_cache_config(
     cachefs_model: Any,
     cachefs_enabled: bool,
     runtime_enabled: bool,
-) -> tuple[Dict[str, Any], set[str]]:
+) -> Dict[str, Any]:
     provider = provider_config.provider.strip()
     params = dict(provider_config.params)
     cache_config = _disabled_cache_config(cachefs_model)
@@ -141,64 +110,10 @@ def _build_provider_cache_config(
 
         redis = RedisCacheConfig.model_validate(params)
         cache_config["redis"] = redis.model_dump(mode="json")
-        return cache_config, set(redis.model_fields_set)
+        return cache_config
     if provider == "dynamic":
         cache_config["dynamic"] = params
-    return cache_config, set()
-
-
-def _merge_legacy_queuefs_redis_config(
-    cache_config: Dict[str, Any],
-    *,
-    provider: str,
-    provider_explicit: bool,
-    redis_explicit: set[str],
-    queuefs_model: Any,
-) -> None:
-    """Normalize the legacy QueueFS Redis connection into the shared Runtime config."""
-    if provider_explicit and provider != "redis":
-        raise ValueError("queuefs backend=redis conflicts with the global cache provider")
-
-    cache_config["provider"] = "redis"
-    target = cache_config.setdefault("redis", {})
-    explicit = redis_explicit
-    legacy_explicit = queuefs_model.redis.model_fields_set
-    legacy = queuefs_model.redis.model_dump(mode="json")
-    legacy["mode"] = "standalone" if legacy["mode"] == "singleton" else legacy["mode"]
-
-    nullable_strings = {
-        "master_name",
-        "username",
-        "password",
-        "sentinel_username",
-        "sentinel_password",
-    }
-    fields = (
-        "mode",
-        "endpoints",
-        "master_name",
-        "username",
-        "password",
-        "sentinel_username",
-        "sentinel_password",
-        "db",
-        "connect_timeout_ms",
-        "command_timeout_ms",
-        "tls_insecure_skip_verify",
-    )
-    for field in fields:
-        value = legacy[field]
-        if field in nullable_strings and value is None:
-            value = "" if field != "master_name" else None
-        if field in explicit and field in legacy_explicit and target.get(field) != value:
-            raise ValueError(f"conflicting Redis setting: {field}")
-        if field in legacy_explicit or field not in explicit:
-            target[field] = value
-
-    if legacy.get("password") and target.get("password_env"):
-        raise ValueError("conflicting Redis setting: password")
-    if legacy.get("sentinel_password") and target.get("sentinel_password_env"):
-        raise ValueError("conflicting Redis setting: sentinel_password")
+    return cache_config
 
 
 def _run_coro_blocking(coro: Any) -> Any:
@@ -322,7 +237,7 @@ def resolve_queuefs_mount_point(config: Any = None) -> str:
 
 
 def _build_queuefs_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str, Any]:
-    """Build QueueFS plugin configuration from AGFS config with legacy compatibility."""
+    """Build QueueFS plugin configuration from AGFS config."""
     default_queue_db_path = data_path / "_system" / "queue" / "queue.db"
     queuefs_config = getattr(agfs_config, "queuefs", None)
 
@@ -344,9 +259,6 @@ def _build_queuefs_plugin_config(agfs_config: Any, data_path: Path) -> Dict[str,
             queue_db_path = str(default_queue_db_path)
 
         plugin_config["db_path"] = queue_db_path
-
-    if backend == "redis":
-        plugin_config["redis"] = queuefs_config.redis.model_dump()
 
     if backend == "cache":
         plugin_config["cache_key_prefix"] = queuefs_config.cache_key_prefix

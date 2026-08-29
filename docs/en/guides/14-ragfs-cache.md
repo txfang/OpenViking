@@ -70,6 +70,21 @@ Available Providers:
 
 `MemoryMockProvider` is only used by unit and smoke tests; it is not a production configuration option.
 
+## Breaking Configuration Change
+
+Legacy cache configuration is no longer accepted. Migrate before upgrading:
+
+| Removed configuration | Canonical replacement |
+|-----------------------|-----------------------|
+| `storage.agfs.cache` | top-level `cache.provider` + `cache.params`, plus `storage.agfs.cachefs.backend="cache"` |
+| `storage.agfs.queuefs.backend="redis"` and `queuefs.redis` | `storage.agfs.queuefs.backend="cache"`, plus the shared top-level `cache` section |
+| Redis `mode="singleton"` | `mode="standalone"` |
+| `tls_enabled=true` | use `rediss://` endpoints |
+| `read_from_replica` | removed; all reads use the primary |
+| Redis Provider `key_prefix` | CacheFS uses `cachefs.namespace`; QueueFS uses `queuefs.cache_key_prefix` |
+
+OpenViking rejects removed fields with a migration error instead of silently translating them.
+
 ## Future DynamicProvider
 
 This release only ships the built-in RedisProvider. DynamicProvider, `.so` loading, and the versioned C ABI are deferred; configuring `provider=dynamic` currently returns UnsupportedProvider during startup.
@@ -114,7 +129,6 @@ Redis configuration:
 | `pool_size` | `32` | Command concurrency |
 | `connect_timeout_ms` | `1000` | Connection timeout |
 | `command_timeout_ms` | `20` | Command timeout |
-| `key_prefix` | `""` | Reserved compatibility field; the unified Runtime requires an empty value |
 | `default_ttl_seconds` | `3600` | Default TTL; `0` means no TTL |
 | `tls_insecure_skip_verify` | `false` | Skip certificate verification for `rediss://`; intended only for controlled test environments |
 

@@ -19,9 +19,7 @@ use super::errors::{Error, Result};
 #[cfg(feature = "cache")]
 use crate::cache::{CacheNamespace, CachePolicy};
 #[cfg(feature = "cache")]
-use crate::cache_runtime::{
-    CacheRuntime, DynamicProviderConfig, RedisProviderConfig,
-};
+use crate::cache_runtime::{CacheRuntime, DynamicProviderConfig, RedisProviderConfig};
 
 use crate::lock::{
     FilesystemPathLockProvider, MemoryPathLockProvider, PathLockConfig, PathLockManager,
@@ -202,7 +200,7 @@ async fn build_stack_with_mountable_and_runtime(
     let provider: Arc<dyn PathLockProvider> = match config.pathlock.provider.as_str() {
         "memory" => Arc::new(MemoryPathLockProvider::new()),
         _ => Arc::new(FilesystemPathLockProvider::new(
-            mountable.clone() as Arc<dyn FileSystem>,
+            mountable.clone() as Arc<dyn FileSystem>
         )),
     };
     let pathlock_manager = Arc::new(PathLockManager::new(
@@ -440,11 +438,9 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(
-            error
-                .to_string()
-                .contains("does not cover the requested operation")
-        );
+        assert!(error
+            .to_string()
+            .contains("does not cover the requested operation"));
         manager.release(&outer).await.unwrap();
     }
 
@@ -513,7 +509,6 @@ mod tests {
             Some(CacheStackConfig {
                 provider: Some(CacheRuntimeProviderConfig::Redis(RedisProviderConfig {
                     endpoints: vec![endpoint],
-                    key_prefix: String::new(),
                     command_timeout_ms: 1_000,
                     ..RedisProviderConfig::default()
                 })),
@@ -523,10 +518,7 @@ mod tests {
         .await
         .unwrap();
         let mut params = HashMap::new();
-        params.insert(
-            "backend".into(),
-            ConfigValue::String("cache".into()),
-        );
+        params.insert("backend".into(), ConfigValue::String("cache".into()));
         params.insert(
             "cache_key_prefix".into(),
             ConfigValue::String(format!("builder-test-{}", uuid::Uuid::new_v4())),
@@ -543,7 +535,10 @@ mod tests {
             .write("/queue/jobs/enqueue", b"job", 0, WriteFlag::None)
             .await
             .unwrap();
-        assert_eq!(stack.top.read("/queue/jobs/size", 0, 0).await.unwrap(), b"1");
+        assert_eq!(
+            stack.top.read("/queue/jobs/size", 0, 0).await.unwrap(),
+            b"1"
+        );
     }
 
     #[tokio::test]

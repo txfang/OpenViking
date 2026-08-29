@@ -16,6 +16,7 @@ use tracing::warn;
 use crate::lock::{AutoPathLockAction, PathLockKind, PathLockManager, PathLockRequest};
 use crate::multibackend::factory::build_multi_write_fs;
 use crate::multibackend::types::MultiBackendBuildContext;
+use crate::plugins::QueueFileSystem;
 use crate::shape::validate::ensure_backend_shape;
 
 use super::internal_names::is_hidden_internal_name;
@@ -145,6 +146,27 @@ impl MountableFS {
             return Self::as_multiwrite(&arc.0);
         }
         None
+    }
+
+    fn as_queuefs_ref(fs: &dyn FileSystem) -> Option<&QueueFileSystem> {
+        let any = fs as &dyn std::any::Any;
+        if let Some(queuefs) = any.downcast_ref::<QueueFileSystem>() {
+            return Some(queuefs);
+        }
+        if let Some(stats) = any.downcast_ref::<StatsWrappedFS>() {
+            return Self::as_queuefs_ref(stats.inner_fs().as_ref());
+        }
+        None
+    }
+
+    async fn shutdown_mount(mount_info: &MountInfo) -> Result<()> {
+        if let Some(queuefs) = Self::as_queuefs_ref(mount_info.fs.as_ref()) {
+            queuefs.shutdown().await?;
+        }
+        if let Some(multiwrite) = Self::as_multiwrite(&mount_info.fs) {
+            multiwrite.shutdown().await?;
+        }
+        Ok(())
     }
 
     /// Return whether a mounted wrapper chain contains encryption-owned pathlock.
@@ -499,15 +521,28 @@ impl MountableFS {
                 .ok_or_else(|| Error::MountPointNotFound(normalized_path.clone()))?
         };
 
-        if let Some(multiwrite) = Self::as_multiwrite(&mount_info.fs) {
-            multiwrite.shutdown().await?;
-        }
+        Self::shutdown_mount(&mount_info).await?;
 
         let mut mounts = self.mounts.write().await;
         if mounts.remove(&normalized_path).is_none() {
             return Err(Error::MountPointNotFound(normalized_path));
         }
 
+        Ok(())
+    }
+
+    /// Stop background work owned by all mounted filesystems.
+    pub async fn shutdown(&self) -> Result<()> {
+        let mounts = {
+            let mounts = self.mounts.read().await;
+            mounts
+                .iter()
+                .map(|(_, mount_info)| mount_info.clone())
+                .collect::<Vec<_>>()
+        };
+        for mount_info in mounts {
+            Self::shutdown_mount(&mount_info).await?;
+        }
         Ok(())
     }
 
@@ -1135,6 +1170,8 @@ impl FileSystem for MountableFS {
 mod tests {
     use super::*;
     use crate::core::BackendItemConfig;
+    #[cfg(feature = "cache")]
+    use crate::core::ConfigValue;
     use crate::core::RedirectPolicy;
     use crate::shape::SHAPE_MANIFEST_PATH;
     use serde_json::Value;
@@ -1600,6 +1637,32 @@ mod tests {
             provider.keys().await.is_empty(),
             "queuefs control filesystem should not populate shared cache"
         );
+    }
+
+    #[cfg(feature = "cache")]
+    #[tokio::test]
+    async fn shutdown_reaches_cache_queuefs_through_stats_wrapper() {
+        use crate::cache_runtime::{CacheRuntime, MemoryMockProvider};
+        use crate::plugins::QueueFSPlugin;
+
+        let provider = Arc::new(MemoryMockProvider::new());
+        let runtime = CacheRuntime::memory_with_provider(provider.clone());
+        let mfs = MountableFS::new();
+        mfs.register_plugin(QueueFSPlugin::with_cache_runtime(runtime))
+            .await;
+        let mut params = HashMap::new();
+        params.insert("backend".into(), ConfigValue::String("cache".into()));
+        params.insert(
+            "cache_key_prefix".into(),
+            ConfigValue::String("mountable-shutdown-test".into()),
+        );
+        mfs.mount(PluginConfig::single_backend("queuefs", "/queue", params))
+            .await
+            .unwrap();
+
+        assert_eq!(provider.keys().await.len(), 1);
+        mfs.shutdown().await.unwrap();
+        assert!(provider.keys().await.is_empty());
     }
 
     #[tokio::test]

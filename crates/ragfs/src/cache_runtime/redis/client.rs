@@ -54,15 +54,21 @@ impl RedisClient {
             .build()
             .map_err(|error| map_fred_error("build", error))?;
         let connect_timeout = Duration::from_millis(config.connect_timeout_ms);
-        let connection_task = tokio::time::timeout(connect_timeout, client.init())
-            .await
-            .map_err(|_| {
-                CacheError::Timeout(format!(
+        let connection_task = client.connect();
+        match tokio::time::timeout(connect_timeout, client.wait_for_connect()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                let _ = terminate_connection_task(&client, connection_task, connect_timeout).await;
+                return Err(map_fred_error("connect", error));
+            }
+            Err(_) => {
+                let _ = terminate_connection_task(&client, connection_task, connect_timeout).await;
+                return Err(CacheError::Timeout(format!(
                     "Redis connect exceeded {} ms",
                     config.connect_timeout_ms
-                ))
-            })?
-            .map_err(|error| map_fred_error("connect", error))?;
+                )));
+            }
+        }
         let concurrency_limit = u32::try_from(config.pool_size).map_err(|_| {
             CacheError::InvalidArgument("Redis pool_size exceeds the supported limit".into())
         })?;
@@ -76,7 +82,10 @@ impl RedisClient {
             deployment_mode,
             closed: AtomicBool::new(false),
         };
-        result.health_check().await?;
+        if let Err(error) = result.health_check().await {
+            let _ = result.close().await;
+            return Err(error);
+        }
         Ok(result)
     }
 
@@ -389,17 +398,13 @@ impl RedisClient {
             .acquire_many_owned(self.concurrency_limit)
             .await
             .map_err(|_| CacheError::Closed)?;
-        self.client
-            .quit()
-            .await
-            .map_err(|error| map_fred_error("QUIT", error))?;
-        if let Some(task) = self.connection_task.lock().await.take() {
-            task.await
-                .map_err(|error| CacheError::Internal(format!("Redis task failed: {error}")))?
-                .map_err(|error| map_fred_error("connection task", error))?;
-        }
+        let task = self.connection_task.lock().await.take();
+        let result = match task {
+            Some(task) => terminate_connection_task(&self.client, task, self.command_timeout).await,
+            None => Ok(()),
+        };
         drop(permits);
-        Ok(())
+        result
     }
 
     fn require_same_slot(&self, keys: &[String], operation: &str) -> CacheResult<()> {
@@ -411,6 +416,29 @@ impl RedisClient {
             Ok(())
         }
     }
+}
+
+async fn terminate_connection_task(
+    client: &Client,
+    task: ConnectHandle,
+    timeout_duration: Duration,
+) -> CacheResult<()> {
+    let quit_result = match tokio::time::timeout(timeout_duration, client.quit()).await {
+        Ok(result) => result.map_err(|error| map_fred_error("QUIT", error)),
+        Err(_) => Err(CacheError::Timeout(format!(
+            "Redis QUIT exceeded {} ms",
+            timeout_duration.as_millis()
+        ))),
+    };
+
+    task.abort();
+    let task_result = match task.await {
+        Err(error) if error.is_cancelled() => Ok(()),
+        Err(error) => Err(CacheError::Internal(format!("Redis task failed: {error}"))),
+        Ok(result) => result.map_err(|error| map_fred_error("connection task", error)),
+    };
+
+    quit_result.and(task_result)
 }
 
 fn fred_config(
@@ -567,5 +595,57 @@ fn map_fred_error(operation: &str, error: FredError) -> CacheError {
             CacheError::InvalidData(format!("Redis {operation}: {error}"))
         }
         _ => CacheError::Internal(format!("Redis {operation}: {error}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    #[test]
+    fn repeated_connect_timeouts_release_connection_tasks() {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let accept_task = tokio::spawn(async move {
+                let mut sockets = Vec::new();
+                while let Ok((socket, _)) = listener.accept().await {
+                    sockets.push(socket);
+                }
+            });
+            tokio::task::yield_now().await;
+            let baseline = tokio::runtime::Handle::current()
+                .metrics()
+                .num_alive_tasks();
+            let config = RedisProviderConfig {
+                endpoints: vec![format!("redis://{address}")],
+                connect_timeout_ms: 25,
+                command_timeout_ms: 10_000,
+                ..RedisProviderConfig::default()
+            };
+
+            for _ in 0..3 {
+                let error = match RedisClient::connect(&config).await {
+                    Ok(_) => panic!("Redis connection unexpectedly succeeded"),
+                    Err(error) => error,
+                };
+                assert!(matches!(error, CacheError::Timeout(_)));
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                assert_eq!(
+                    tokio::runtime::Handle::current()
+                        .metrics()
+                        .num_alive_tasks(),
+                    baseline
+                );
+            }
+
+            accept_task.abort();
+        });
     }
 }
