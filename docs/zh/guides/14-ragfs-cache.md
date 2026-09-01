@@ -136,7 +136,7 @@ Redis 配置：
 
 未来 DynamicProvider 配置结构：
 
-`cache.params` 完全由外部 Provider 定义，下面的字段只用于说明配置传递方式，实际配置以 Provider 发布说明为准。
+`cache.params.library` 由 OpenViking 用于加载动态库，其余字段由外部 Provider 定义并作为 JSON 传入 `create`。实际参数以 Provider 发布说明为准。
 
 ```json
 {

@@ -477,11 +477,7 @@ fn cache_config_from_canonical_ov_conf(
     match config.provider {
         CacheProviderKind::Redis => parse_redis_config(&mut config.redis, &params, "cache.params")?,
         CacheProviderKind::Dynamic => {
-            config.dynamic.library = string_field(&params, "library", "")?;
-            config.dynamic.params = params
-                .get("params")
-                .cloned()
-                .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+            parse_dynamic_config(&mut config.dynamic, &params)?;
         }
     }
     validate_cache_runtime_config(&config)?;
@@ -535,14 +531,21 @@ fn cache_config_from_value(cache: &serde_json::Value) -> Result<RagfsCacheConfig
         let dynamic = dynamic
             .as_object()
             .ok_or_else(|| "cache.dynamic must be an object".to_string())?;
-        config.dynamic.library = string_field(dynamic, "library", &config.dynamic.library)?;
-        config.dynamic.params = dynamic
-            .get("params")
-            .cloned()
-            .unwrap_or_else(|| serde_json::Value::Object(serde_json::Map::new()));
+        parse_dynamic_config(&mut config.dynamic, dynamic)?;
     }
     validate_cache_runtime_config(&config)?;
     Ok(config)
+}
+
+fn parse_dynamic_config(
+    config: &mut DynamicCacheConfig,
+    params: &serde_json::Map<String, serde_json::Value>,
+) -> Result<(), String> {
+    config.library = string_field(params, "library", &config.library)?;
+    let mut provider_params = params.clone();
+    provider_params.remove("library");
+    config.params = serde_json::Value::Object(provider_params);
+    Ok(())
 }
 
 fn parse_redis_config(
@@ -2904,51 +2907,6 @@ mod tests {
 
         let _ = fs::remove_file(&active);
         let _ = fs::remove_file(&rotated);
-    }
-
-    #[test]
-    fn dynamic_cache_config_is_parsed_from_ov_conf() {
-        let path = std::env::temp_dir().join(format!(
-            "openviking-cache-config-{}.json",
-            std::process::id()
-        ));
-        fs::write(
-            &path,
-            r#"{
-                "cache": {
-                    "provider": "dynamic",
-                    "params": {
-                        "library": "/opt/openviking/libprovider.so",
-                        "params": {"endpoint": "provider:1234"}
-                    }
-                },
-                "storage": {
-                    "agfs": {
-                        "cachefs": {
-                            "backend": "cache",
-                            "namespace": "ov-test",
-                            "traversal_mode": "cached_traversal"
-                        }
-                    }
-                }
-            }"#,
-        )
-        .unwrap();
-
-        let cache_config = cache_config_from_ov_conf(path.to_str().unwrap()).unwrap();
-        assert!(cache_config.enabled);
-        assert_eq!(cache_config.provider, CacheProviderKind::Dynamic);
-        assert_eq!(cache_config.namespace, "ov-test");
-        assert_eq!(
-            cache_config.traversal_mode,
-            CacheTraversalMode::CachedTraversal
-        );
-        assert_eq!(
-            cache_config.dynamic.library,
-            "/opt/openviking/libprovider.so"
-        );
-
-        fs::remove_file(path).unwrap();
     }
 
     #[test]

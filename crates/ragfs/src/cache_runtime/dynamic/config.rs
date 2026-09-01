@@ -3,8 +3,8 @@ use std::path::PathBuf;
 /// Configuration for one dynamically loaded cache provider.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DynamicProviderConfig {
-    /// Absolute or process-resolvable path to the provider library.
+    /// Absolute path to the provider library.
     pub library_path: PathBuf,
-    /// Provider-owned JSON configuration passed unchanged to `init`.
+    /// Provider-owned JSON configuration passed unchanged to `create`.
     pub params_json: String,
 }

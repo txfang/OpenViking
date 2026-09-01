@@ -136,7 +136,7 @@ All Redis reads are sent to the primary node so QueueFS does not observe stale q
 
 Future DynamicProvider configuration shape:
 
-`cache.params` is entirely Provider-owned. The fields below only illustrate configuration forwarding; use the schema documented by the Provider publisher.
+OpenViking uses `cache.params.library` to load the dynamic library. All remaining fields are Provider-owned and passed to `create` as JSON. Use the schema documented by the Provider publisher.
 
 ```json
 {
