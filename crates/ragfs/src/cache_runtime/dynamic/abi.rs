@@ -45,28 +45,28 @@ impl ByteSliceV1 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct OwnedBufferV1 {
     pub(super) data: *mut u8,
     pub(super) len: usize,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct OptionalOwnedBufferV1 {
     pub(super) value: OwnedBufferV1,
     pub(super) present: u8,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct OwnedBufferArrayV1 {
     pub(super) items: *mut OwnedBufferV1,
     pub(super) len: usize,
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct OptionalOwnedBufferArrayV1 {
     pub(super) items: *mut OptionalOwnedBufferV1,
     pub(super) len: usize,
@@ -88,7 +88,7 @@ pub(super) struct SetOptionsV1 {
 }
 
 #[repr(C)]
-#[derive(Clone, Copy, Default)]
+#[derive(Default)]
 pub(super) struct ScriptValueV1 {
     pub(super) bytes: OwnedBufferV1,
     pub(super) items: *mut ScriptValueV1,

@@ -11,12 +11,24 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use libloading::Library;
 use std::alloc::{alloc, dealloc, Layout};
+use std::collections::HashMap;
 use std::ffi::c_void;
-use std::mem::{align_of, size_of};
+use std::mem::size_of;
 use std::ptr;
 use std::slice;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::{Arc, Mutex, OnceLock, RwLock};
+
+const LIFECYCLE_OPEN: u8 = 0;
+const LIFECYCLE_CLOSING: u8 = 1;
+const LIFECYCLE_CLOSED: u8 = 2;
+const MAX_HOST_ALLOCATION_BYTES: usize = 128 * 1024 * 1024;
+const MAX_BUFFER_BYTES: usize = 64 * 1024 * 1024;
+const MAX_ERROR_BYTES: usize = 64 * 1024;
+const MAX_ARRAY_ITEMS: usize = 100_000;
+const MAX_AGGREGATE_BYTES: usize = 128 * 1024 * 1024;
+const MAX_SCRIPT_DEPTH: usize = 64;
+const MAX_SCRIPT_NODES: usize = 100_000;
 
 static HOST_API: HostApiV1 = HostApiV1 {
     abi_version: ABI_VERSION_V1,
@@ -35,7 +47,7 @@ struct DynamicState {
     api: ProviderApiV1,
     handle: *mut c_void,
     calls: RwLock<()>,
-    closed: AtomicBool,
+    lifecycle: AtomicU8,
 }
 
 // The ABI requires the provider handle to support concurrent calls. A provider
@@ -140,8 +152,14 @@ impl DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, operation.name())?;
-                take_buffer_array(output)
+                take_output(
+                    status,
+                    error,
+                    operation.name(),
+                    output,
+                    take_buffer_array,
+                    discard_buffer_array,
+                )
             })
         })
         .await
@@ -172,7 +190,7 @@ fn connect_state(config: DynamicProviderConfig) -> CacheResult<Arc<DynamicState>
         api: loaded.api,
         handle,
         calls: RwLock::new(()),
-        closed: AtomicBool::new(false),
+        lifecycle: AtomicU8::new(LIFECYCLE_OPEN),
     }))
 }
 
@@ -186,7 +204,7 @@ impl DynamicState {
             .calls
             .read()
             .map_err(|_| CacheError::Internal("dynamic provider call lock poisoned".into()))?;
-        if self.closed.load(Ordering::Acquire) {
+        if self.lifecycle.load(Ordering::Acquire) != LIFECYCLE_OPEN {
             return Err(CacheError::Closed);
         }
         call(&self.api, self.handle).map_err(|error| match error {
@@ -234,24 +252,50 @@ impl DynamicState {
     }
 
     fn close(&self) -> CacheResult<()> {
-        if self.closed.swap(true, Ordering::AcqRel) {
-            return Ok(());
+        match self.lifecycle.compare_exchange(
+            LIFECYCLE_OPEN,
+            LIFECYCLE_CLOSING,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(state) if matches!(state, LIFECYCLE_CLOSING | LIFECYCLE_CLOSED) => return Ok(()),
+            Err(other) => {
+                return Err(CacheError::Internal(format!(
+                    "dynamic provider has invalid lifecycle state {other}"
+                )))
+            }
         }
         let _guard = self
             .calls
             .write()
-            .map_err(|_| CacheError::Internal("dynamic provider call lock poisoned".into()))?;
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let callback = self.api.close.expect("validated close callback");
         let mut error = OwnedBufferV1::default();
         let status = unsafe { callback(self.handle, &mut error) };
+        self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
         status_result(status, error, "close")
     }
 }
 
 impl Drop for DynamicState {
     fn drop(&mut self) {
-        if !self.closed.swap(true, Ordering::AcqRel) {
+        if self
+            .lifecycle
+            .compare_exchange(
+                LIFECYCLE_OPEN,
+                LIFECYCLE_CLOSING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            )
+            .is_ok()
+        {
+            let _guard = self
+                .calls
+                .write()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             close_handle(self.api, self.handle);
+            self.lifecycle.store(LIFECYCLE_CLOSED, Ordering::Release);
         }
     }
 }
@@ -286,8 +330,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "get")?;
-                take_optional_buffer(output)
+                take_output(
+                    status,
+                    error,
+                    "get",
+                    output,
+                    take_optional_buffer,
+                    discard_optional_buffer,
+                )
             })
         })
         .await
@@ -376,8 +426,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "mget")?;
-                let values = take_optional_buffer_array(output)?;
+                let values = take_output(
+                    status,
+                    error,
+                    "mget",
+                    output,
+                    take_optional_buffer_array,
+                    discard_optional_buffer_array,
+                )?;
                 if values.len() != keys.len() {
                     return Err(CacheError::InvalidData(format!(
                         "dynamic provider mget returned {} values for {} keys",
@@ -477,8 +533,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "smembers")?;
-                take_buffer_array(output)
+                take_output(
+                    status,
+                    error,
+                    "smembers",
+                    output,
+                    take_buffer_array,
+                    discard_buffer_array,
+                )
             })
         })
         .await
@@ -525,8 +587,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "lrange")?;
-                take_buffer_array(output)
+                take_output(
+                    status,
+                    error,
+                    "lrange",
+                    output,
+                    take_buffer_array,
+                    discard_buffer_array,
+                )
             })
         })
         .await
@@ -548,8 +616,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "lindex")?;
-                take_optional_buffer(output)
+                take_output(
+                    status,
+                    error,
+                    "lindex",
+                    output,
+                    take_optional_buffer,
+                    discard_optional_buffer,
+                )
             })
         })
         .await
@@ -666,8 +740,14 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "lmove")?;
-                take_optional_buffer(output)
+                take_output(
+                    status,
+                    error,
+                    "lmove",
+                    output,
+                    take_optional_buffer,
+                    discard_optional_buffer,
+                )
             })
         })
         .await
@@ -695,8 +775,23 @@ impl CacheProvider for DynamicProvider {
                         &mut error,
                     )
                 };
-                status_result(status, error, "execute_script")?;
-                ScriptResult::encode(&take_script_value(output)?)
+                let value = take_output(
+                    status,
+                    error,
+                    "execute_script",
+                    output,
+                    take_script_value,
+                    discard_script_value,
+                )?;
+                let result = ScriptResult::encode(&value)?;
+                if result.payload.len() > MAX_AGGREGATE_BYTES {
+                    return Err(invalid_output(format!(
+                        "encoded script result byte count {} exceeds limit {}",
+                        result.payload.len(),
+                        MAX_AGGREGATE_BYTES
+                    )));
+                }
+                Ok(result)
             })
         })
         .await
@@ -785,13 +880,118 @@ fn byte_slices(values: &[Bytes]) -> Vec<ByteSliceV1> {
         .collect()
 }
 
-fn status_result(status: i32, error: OwnedBufferV1, operation: &str) -> CacheResult<()> {
-    let message = take_buffer(error)
-        .map(|value| String::from_utf8_lossy(&value).into_owned())
-        .unwrap_or_else(|buffer_error| buffer_error.to_string());
-    if status == STATUS_OK {
-        return Ok(());
+#[derive(Default)]
+struct DecodeBudget {
+    aggregate_bytes: usize,
+    script_nodes: usize,
+}
+
+impl DecodeBudget {
+    fn charge_bytes(&mut self, bytes: usize, label: &str) -> CacheResult<()> {
+        self.aggregate_bytes = self
+            .aggregate_bytes
+            .checked_add(bytes)
+            .ok_or_else(|| invalid_output(format!("{label} aggregate byte count overflowed")))?;
+        if self.aggregate_bytes > MAX_AGGREGATE_BYTES {
+            return Err(invalid_output(format!(
+                "{label} aggregate byte count {} exceeds limit {}",
+                self.aggregate_bytes, MAX_AGGREGATE_BYTES
+            )));
+        }
+        Ok(())
     }
+
+    fn charge_script_node(&mut self) -> CacheResult<()> {
+        self.script_nodes = self
+            .script_nodes
+            .checked_add(1)
+            .ok_or_else(|| invalid_output("script node count overflowed"))?;
+        if self.script_nodes > MAX_SCRIPT_NODES {
+            return Err(invalid_output(format!(
+                "script node count {} exceeds limit {}",
+                self.script_nodes, MAX_SCRIPT_NODES
+            )));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+struct RegisteredAllocation {
+    data: *mut u8,
+    layout: Layout,
+}
+
+impl Drop for RegisteredAllocation {
+    fn drop(&mut self) {
+        unsafe { dealloc(self.data, self.layout) };
+    }
+}
+
+struct PendingBuffers {
+    items: std::vec::IntoIter<OwnedBufferV1>,
+}
+
+impl Drop for PendingBuffers {
+    fn drop(&mut self) {
+        for item in self.items.by_ref() {
+            discard_buffer(item);
+        }
+    }
+}
+
+struct PendingOptionalBuffers {
+    items: std::vec::IntoIter<OptionalOwnedBufferV1>,
+}
+
+impl Drop for PendingOptionalBuffers {
+    fn drop(&mut self) {
+        for item in self.items.by_ref() {
+            discard_buffer(item.value);
+        }
+    }
+}
+
+struct PendingScriptValues {
+    items: std::vec::IntoIter<ScriptValueV1>,
+}
+
+impl Drop for PendingScriptValues {
+    fn drop(&mut self) {
+        for item in self.items.by_ref() {
+            discard_script_value(item);
+        }
+    }
+}
+
+fn take_output<T, O>(
+    status: i32,
+    error: OwnedBufferV1,
+    operation: &str,
+    output: O,
+    take: impl FnOnce(O) -> CacheResult<T>,
+    discard: impl FnOnce(O),
+) -> CacheResult<T> {
+    match status_result(status, error, operation) {
+        Ok(()) => take(output),
+        Err(error) => {
+            discard(output);
+            Err(error)
+        }
+    }
+}
+
+fn status_result(status: i32, error: OwnedBufferV1, operation: &str) -> CacheResult<()> {
+    let message = take_buffer_with_limit(error, MAX_ERROR_BYTES, "error buffer")?;
+    if status == STATUS_OK {
+        if message.is_empty() {
+            return Ok(());
+        }
+        return Err(invalid_output(format!(
+            "dynamic provider {operation} returned an error payload with success status"
+        )));
+    }
+    let message = String::from_utf8_lossy(&message);
     let details = if message.is_empty() {
         format!("dynamic provider {operation} failed with status {status}")
     } else {
@@ -823,103 +1023,468 @@ fn take_bool(value: u8, operation: &str) -> CacheResult<bool> {
 
 fn take_optional_buffer(value: OptionalOwnedBufferV1) -> CacheResult<Option<Bytes>> {
     match value.present {
-        0 => Ok(None),
+        0 if is_empty_buffer(&value.value) => Ok(None),
+        0 => {
+            discard_buffer(value.value);
+            Err(invalid_output(
+                "absent optional buffer returned a non-empty value",
+            ))
+        }
         1 => take_buffer(value.value).map(Some),
-        other => Err(CacheError::InvalidData(format!(
-            "dynamic provider returned invalid optional flag {other}"
-        ))),
+        other => {
+            discard_buffer(value.value);
+            Err(invalid_output(format!(
+                "dynamic provider returned invalid optional flag {other}"
+            )))
+        }
     }
 }
 
 fn take_buffer(buffer: OwnedBufferV1) -> CacheResult<Bytes> {
+    take_buffer_with_limit(buffer, MAX_BUFFER_BYTES, "buffer")
+}
+
+fn take_buffer_with_limit(
+    buffer: OwnedBufferV1,
+    max_bytes: usize,
+    label: &str,
+) -> CacheResult<Bytes> {
+    let mut budget = DecodeBudget::default();
+    take_buffer_with_budget(buffer, max_bytes, label, &mut budget)
+}
+
+fn take_buffer_with_budget(
+    buffer: OwnedBufferV1,
+    max_bytes: usize,
+    label: &str,
+    budget: &mut DecodeBudget,
+) -> CacheResult<Bytes> {
     if buffer.len == 0 {
-        return Ok(Bytes::new());
+        if buffer.data.is_null() {
+            return Ok(Bytes::new());
+        }
+        release_registered(buffer.data);
+        return Err(invalid_output(format!(
+            "dynamic provider returned a non-null empty {label}"
+        )));
     }
     if buffer.data.is_null() {
-        return Err(CacheError::InvalidData(
-            "dynamic provider returned a null buffer".into(),
-        ));
+        return Err(invalid_output(format!(
+            "dynamic provider returned a null {label}"
+        )));
     }
+    let allocation = claim_allocation::<u8>(buffer.data, buffer.len, max_bytes, label, budget)?;
     let value = Bytes::copy_from_slice(unsafe { slice::from_raw_parts(buffer.data, buffer.len) });
-    unsafe { host_dealloc(buffer.data, buffer.len, align_of::<u8>()) };
+    drop(allocation);
     Ok(value)
 }
 
 fn take_buffer_array(array: OwnedBufferArrayV1) -> CacheResult<Vec<Bytes>> {
+    let mut budget = DecodeBudget::default();
+    take_buffer_array_with_budget(array, &mut budget)
+}
+
+fn take_buffer_array_with_budget(
+    array: OwnedBufferArrayV1,
+    budget: &mut DecodeBudget,
+) -> CacheResult<Vec<Bytes>> {
     if array.len == 0 {
-        return Ok(Vec::new());
-    }
-    if array.items.is_null() {
-        return Err(CacheError::InvalidData(
-            "dynamic provider returned a null buffer array".into(),
+        if array.items.is_null() {
+            return Ok(Vec::new());
+        }
+        release_registered(array.items.cast::<u8>());
+        return Err(invalid_output(
+            "dynamic provider returned a non-null empty buffer array",
         ));
     }
-    let items = unsafe { slice::from_raw_parts(array.items, array.len) }.to_vec();
-    unsafe {
-        host_dealloc(
-            array.items.cast::<u8>(),
-            array.len * size_of::<OwnedBufferV1>(),
-            align_of::<OwnedBufferV1>(),
-        )
+    if array.items.is_null() {
+        return Err(invalid_output(
+            "dynamic provider returned a null buffer array",
+        ));
+    }
+    let items = take_raw_array(array.items, array.len, "buffer array", budget)?;
+    let mut pending = PendingBuffers {
+        items: items.into_iter(),
     };
-    items.into_iter().map(take_buffer).collect()
+    let mut values = Vec::with_capacity(array.len);
+    while let Some(item) = pending.items.next() {
+        values.push(take_buffer_with_budget(
+            item,
+            MAX_BUFFER_BYTES,
+            "buffer array item",
+            budget,
+        )?);
+    }
+    Ok(values)
 }
 
 fn take_optional_buffer_array(
     array: OptionalOwnedBufferArrayV1,
 ) -> CacheResult<Vec<Option<Bytes>>> {
+    let mut budget = DecodeBudget::default();
     if array.len == 0 {
-        return Ok(Vec::new());
-    }
-    if array.items.is_null() {
-        return Err(CacheError::InvalidData(
-            "dynamic provider returned a null optional buffer array".into(),
+        if array.items.is_null() {
+            return Ok(Vec::new());
+        }
+        release_registered(array.items.cast::<u8>());
+        return Err(invalid_output(
+            "dynamic provider returned a non-null empty optional buffer array",
         ));
     }
-    let items = unsafe { slice::from_raw_parts(array.items, array.len) }.to_vec();
-    unsafe {
-        host_dealloc(
-            array.items.cast::<u8>(),
-            array.len * size_of::<OptionalOwnedBufferV1>(),
-            align_of::<OptionalOwnedBufferV1>(),
-        )
+    if array.items.is_null() {
+        return Err(invalid_output(
+            "dynamic provider returned a null optional buffer array",
+        ));
+    }
+    let items = take_raw_array(array.items, array.len, "optional buffer array", &mut budget)?;
+    let mut pending = PendingOptionalBuffers {
+        items: items.into_iter(),
     };
-    items.into_iter().map(take_optional_buffer).collect()
+    let mut values = Vec::with_capacity(array.len);
+    while let Some(item) = pending.items.next() {
+        values.push(take_optional_buffer_with_budget(item, &mut budget)?);
+    }
+    Ok(values)
 }
 
 fn take_script_value(value: ScriptValueV1) -> CacheResult<ScriptValue> {
-    match value.kind {
-        SCRIPT_NULL => Ok(ScriptValue::Null),
-        SCRIPT_INTEGER => Ok(ScriptValue::Integer(value.integer)),
-        SCRIPT_BYTES => take_buffer(value.bytes).map(|value| ScriptValue::Bytes(value.to_vec())),
-        SCRIPT_BOOLEAN => take_bool(value.boolean, "execute_script").map(ScriptValue::Boolean),
+    let mut budget = DecodeBudget::default();
+    take_script_value_with_budget(value, 0, &mut budget)
+}
+
+fn take_script_value_with_budget(
+    value: ScriptValueV1,
+    depth: usize,
+    budget: &mut DecodeBudget,
+) -> CacheResult<ScriptValue> {
+    if depth > MAX_SCRIPT_DEPTH {
+        discard_script_value(value);
+        return Err(invalid_output(format!(
+            "script result depth {depth} exceeds limit {MAX_SCRIPT_DEPTH}"
+        )));
+    }
+    if let Err(error) = budget.charge_script_node() {
+        discard_script_value(value);
+        return Err(error);
+    }
+    let ScriptValueV1 {
+        bytes,
+        items,
+        items_len,
+        integer,
+        kind,
+        boolean,
+    } = value;
+    match kind {
+        SCRIPT_NULL => {
+            ensure_unused_script_storage(bytes, items, items_len, "null")?;
+            Ok(ScriptValue::Null)
+        }
+        SCRIPT_INTEGER => {
+            ensure_unused_script_storage(bytes, items, items_len, "integer")?;
+            Ok(ScriptValue::Integer(integer))
+        }
+        SCRIPT_BYTES => {
+            ensure_empty_script_items(items, items_len, "bytes")?;
+            take_buffer_with_budget(bytes, MAX_BUFFER_BYTES, "script bytes", budget)
+                .map(|value| ScriptValue::Bytes(value.to_vec()))
+        }
+        SCRIPT_BOOLEAN => {
+            ensure_unused_script_storage(bytes, items, items_len, "boolean")?;
+            take_bool(boolean, "execute_script").map(ScriptValue::Boolean)
+        }
         SCRIPT_ARRAY => {
-            if value.items_len == 0 {
-                return Ok(ScriptValue::Array(Vec::new()));
-            }
-            if value.items.is_null() {
-                return Err(CacheError::InvalidData(
-                    "dynamic provider returned a null script array".into(),
+            ensure_empty_script_buffer(bytes, "array")?;
+            if items_len == 0 {
+                if items.is_null() {
+                    return Ok(ScriptValue::Array(Vec::new()));
+                }
+                release_registered(items.cast::<u8>());
+                return Err(invalid_output(
+                    "dynamic provider returned a non-null empty script array",
                 ));
             }
-            let items = unsafe { slice::from_raw_parts(value.items, value.items_len) }.to_vec();
-            unsafe {
-                host_dealloc(
-                    value.items.cast::<u8>(),
-                    value.items_len * size_of::<ScriptValueV1>(),
-                    align_of::<ScriptValueV1>(),
-                )
+            if items.is_null() {
+                return Err(invalid_output(
+                    "dynamic provider returned a null script array",
+                ));
+            }
+            let raw_items = take_raw_array(items, items_len, "script array", budget)?;
+            let mut pending = PendingScriptValues {
+                items: raw_items.into_iter(),
             };
-            items
-                .into_iter()
-                .map(take_script_value)
-                .collect::<CacheResult<Vec<_>>>()
-                .map(ScriptValue::Array)
+            let mut values = Vec::with_capacity(items_len);
+            while let Some(item) = pending.items.next() {
+                values.push(take_script_value_with_budget(item, depth + 1, budget)?);
+            }
+            Ok(ScriptValue::Array(values))
         }
-        other => Err(CacheError::InvalidData(format!(
-            "dynamic provider returned invalid script value kind {other}"
-        ))),
+        other => {
+            discard_buffer(bytes);
+            discard_script_items(items, items_len);
+            Err(invalid_output(format!(
+                "dynamic provider returned invalid script value kind {other}"
+            )))
+        }
     }
+}
+
+fn take_optional_buffer_with_budget(
+    value: OptionalOwnedBufferV1,
+    budget: &mut DecodeBudget,
+) -> CacheResult<Option<Bytes>> {
+    match value.present {
+        0 if is_empty_buffer(&value.value) => Ok(None),
+        0 => {
+            discard_buffer(value.value);
+            Err(invalid_output(
+                "absent optional buffer returned a non-empty value",
+            ))
+        }
+        1 => take_buffer_with_budget(value.value, MAX_BUFFER_BYTES, "optional buffer", budget)
+            .map(Some),
+        other => {
+            discard_buffer(value.value);
+            Err(invalid_output(format!(
+                "dynamic provider returned invalid optional flag {other}"
+            )))
+        }
+    }
+}
+
+fn take_raw_array<T>(
+    items: *mut T,
+    len: usize,
+    label: &str,
+    budget: &mut DecodeBudget,
+) -> CacheResult<Vec<T>> {
+    if len > MAX_ARRAY_ITEMS {
+        release_registered(items.cast::<u8>());
+        return Err(invalid_output(format!(
+            "{label} item count {len} exceeds limit {MAX_ARRAY_ITEMS}"
+        )));
+    }
+    let allocation = claim_allocation::<T>(items, len, MAX_HOST_ALLOCATION_BYTES, label, budget)?;
+    let mut values = Vec::with_capacity(len);
+    for index in 0..len {
+        values.push(unsafe { ptr::read(items.add(index)) });
+    }
+    drop(allocation);
+    Ok(values)
+}
+
+fn claim_allocation<T>(
+    data: *mut T,
+    len: usize,
+    max_bytes: usize,
+    label: &str,
+    budget: &mut DecodeBudget,
+) -> CacheResult<RegisteredAllocation> {
+    let layout = Layout::array::<T>(len)
+        .map_err(|_| invalid_output(format!("{label} allocation size overflowed")))?;
+    if layout.size() > isize::MAX as usize {
+        release_registered(data.cast::<u8>());
+        return Err(invalid_output(format!(
+            "{label} allocation exceeds isize::MAX"
+        )));
+    }
+    if layout.size() > max_bytes {
+        release_registered(data.cast::<u8>());
+        return Err(invalid_output(format!(
+            "{label} byte count {} exceeds limit {max_bytes}",
+            layout.size()
+        )));
+    }
+    if (data as usize) % layout.align() != 0 {
+        release_registered(data.cast::<u8>());
+        return Err(invalid_output(format!(
+            "{label} pointer is not aligned to {} bytes",
+            layout.align()
+        )));
+    }
+    if let Err(error) = budget.charge_bytes(layout.size(), label) {
+        release_registered(data.cast::<u8>());
+        return Err(error);
+    }
+    let actual = allocation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(data as usize))
+        .ok_or_else(|| invalid_output(format!("{label} was not allocated by host->alloc")))?;
+    if actual != layout {
+        unsafe { dealloc(data.cast::<u8>(), actual) };
+        return Err(invalid_output(format!(
+            "{label} allocation layout does not match returned length/alignment"
+        )));
+    }
+    Ok(RegisteredAllocation {
+        data: data.cast::<u8>(),
+        layout,
+    })
+}
+
+fn allocation_registry() -> &'static Mutex<HashMap<usize, Layout>> {
+    static ALLOCATIONS: OnceLock<Mutex<HashMap<usize, Layout>>> = OnceLock::new();
+    ALLOCATIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+#[cfg(test)]
+fn host_allocation_is_registered(data: *mut u8) -> bool {
+    allocation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .contains_key(&(data as usize))
+}
+
+fn release_registered(data: *mut u8) {
+    if data.is_null() {
+        return;
+    }
+    let layout = allocation_registry()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(&(data as usize));
+    if let Some(layout) = layout {
+        unsafe { dealloc(data, layout) };
+    }
+}
+
+fn discard_buffer(buffer: OwnedBufferV1) {
+    release_registered(buffer.data);
+}
+
+fn discard_optional_buffer(buffer: OptionalOwnedBufferV1) {
+    discard_buffer(buffer.value);
+}
+
+fn discard_buffer_array(array: OwnedBufferArrayV1) {
+    if array.items.is_null() || array.len == 0 || array.len > MAX_ARRAY_ITEMS {
+        release_registered(array.items.cast::<u8>());
+        return;
+    }
+    let mut budget = DecodeBudget::default();
+    match take_raw_array(
+        array.items,
+        array.len,
+        "discarded buffer array",
+        &mut budget,
+    ) {
+        Ok(items) => {
+            for item in items {
+                discard_buffer(item);
+            }
+        }
+        Err(_) => release_registered(array.items.cast::<u8>()),
+    }
+}
+
+fn discard_optional_buffer_array(array: OptionalOwnedBufferArrayV1) {
+    if array.items.is_null() || array.len == 0 || array.len > MAX_ARRAY_ITEMS {
+        release_registered(array.items.cast::<u8>());
+        return;
+    }
+    let mut budget = DecodeBudget::default();
+    match take_raw_array(
+        array.items,
+        array.len,
+        "discarded optional buffer array",
+        &mut budget,
+    ) {
+        Ok(items) => {
+            for item in items {
+                discard_optional_buffer(item);
+            }
+        }
+        Err(_) => release_registered(array.items.cast::<u8>()),
+    }
+}
+
+fn discard_script_items(items: *mut ScriptValueV1, len: usize) {
+    if items.is_null() {
+        return;
+    }
+    if len == 0 || len > MAX_ARRAY_ITEMS {
+        release_registered(items.cast::<u8>());
+        return;
+    }
+    let mut budget = DecodeBudget::default();
+    match take_raw_array(items, len, "discarded script array", &mut budget) {
+        Ok(values) => {
+            for value in values {
+                discard_script_value(value);
+            }
+        }
+        Err(_) => release_registered(items.cast::<u8>()),
+    }
+}
+
+fn discard_script_value(value: ScriptValueV1) {
+    let mut pending = vec![value];
+    let mut visited = 0usize;
+    while let Some(value) = pending.pop() {
+        visited += 1;
+        let ScriptValueV1 {
+            bytes,
+            items,
+            items_len,
+            ..
+        } = value;
+        discard_buffer(bytes);
+        if items.is_null() {
+            continue;
+        }
+        if visited > MAX_SCRIPT_NODES || items_len == 0 || items_len > MAX_ARRAY_ITEMS {
+            release_registered(items.cast::<u8>());
+            continue;
+        }
+        let mut budget = DecodeBudget::default();
+        match take_raw_array(items, items_len, "discarded script array", &mut budget) {
+            Ok(mut values) => pending.append(&mut values),
+            Err(_) => release_registered(items.cast::<u8>()),
+        }
+    }
+}
+
+fn ensure_unused_script_storage(
+    bytes: OwnedBufferV1,
+    items: *mut ScriptValueV1,
+    items_len: usize,
+    kind: &str,
+) -> CacheResult<()> {
+    ensure_empty_script_buffer(bytes, kind)?;
+    ensure_empty_script_items(items, items_len, kind)
+}
+
+fn ensure_empty_script_buffer(buffer: OwnedBufferV1, kind: &str) -> CacheResult<()> {
+    if is_empty_buffer(&buffer) {
+        return Ok(());
+    }
+    discard_buffer(buffer);
+    Err(invalid_output(format!(
+        "script {kind} value returned an unexpected byte buffer"
+    )))
+}
+
+fn ensure_empty_script_items(
+    items: *mut ScriptValueV1,
+    items_len: usize,
+    kind: &str,
+) -> CacheResult<()> {
+    if items.is_null() && items_len == 0 {
+        return Ok(());
+    }
+    discard_script_items(items, items_len);
+    Err(invalid_output(format!(
+        "script {kind} value returned unexpected child items"
+    )))
+}
+
+fn is_empty_buffer(buffer: &OwnedBufferV1) -> bool {
+    buffer.data.is_null() && buffer.len == 0
+}
+
+fn invalid_output(message: impl Into<String>) -> CacheError {
+    CacheError::InvalidData(message.into())
 }
 
 fn close_handle(api: ProviderApiV1, handle: *mut c_void) {
@@ -936,11 +1501,20 @@ fn close_handle(api: ProviderApiV1, handle: *mut c_void) {
 }
 
 unsafe extern "C" fn host_alloc(size: usize, alignment: usize) -> *mut u8 {
-    if size == 0 {
+    if size == 0 || size > MAX_HOST_ALLOCATION_BYTES {
         return ptr::null_mut();
     }
     match Layout::from_size_align(size, alignment) {
-        Ok(layout) => unsafe { alloc(layout) },
+        Ok(layout) => {
+            let data = unsafe { alloc(layout) };
+            if !data.is_null() {
+                allocation_registry()
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(data as usize, layout);
+            }
+            data
+        }
         Err(_) => ptr::null_mut(),
     }
 }
@@ -949,7 +1523,136 @@ unsafe extern "C" fn host_dealloc(data: *mut u8, size: usize, alignment: usize) 
     if data.is_null() || size == 0 {
         return;
     }
-    if let Ok(layout) = Layout::from_size_align(size, alignment) {
-        unsafe { dealloc(data, layout) };
+    if let Ok(expected) = Layout::from_size_align(size, alignment) {
+        let mut allocations = allocation_registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if allocations.get(&(data as usize)) == Some(&expected) {
+            allocations.remove(&(data as usize));
+            drop(allocations);
+            unsafe { dealloc(data, expected) };
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn script_result_rejects_excessive_nesting() {
+        let mut value = ScriptValueV1 {
+            kind: SCRIPT_NULL,
+            ..ScriptValueV1::default()
+        };
+        for _ in 0..80 {
+            let layout = Layout::array::<ScriptValueV1>(1).unwrap();
+            let items =
+                unsafe { host_alloc(layout.size(), layout.align()) }.cast::<ScriptValueV1>();
+            assert!(!items.is_null());
+            unsafe { ptr::write(items, value) };
+            value = ScriptValueV1 {
+                items,
+                items_len: 1,
+                kind: SCRIPT_ARRAY,
+                ..ScriptValueV1::default()
+            };
+        }
+
+        let error = take_script_value(value).unwrap_err();
+
+        assert!(matches!(error, CacheError::InvalidData(message) if message.contains("depth")));
+    }
+
+    #[test]
+    fn buffer_array_rejects_excessive_item_count() {
+        const ITEM_COUNT: usize = 100_001;
+        let layout = Layout::array::<OwnedBufferV1>(ITEM_COUNT).unwrap();
+        let items = unsafe { host_alloc(layout.size(), layout.align()) }.cast::<OwnedBufferV1>();
+        assert!(!items.is_null());
+        for index in 0..ITEM_COUNT {
+            unsafe { ptr::write(items.add(index), OwnedBufferV1::default()) };
+        }
+
+        let error = take_buffer_array(OwnedBufferArrayV1 {
+            items,
+            len: ITEM_COUNT,
+        })
+        .unwrap_err();
+
+        assert!(
+            matches!(error, CacheError::InvalidData(message) if message.contains("item count"))
+        );
+    }
+
+    #[test]
+    fn optional_array_failure_releases_all_host_allocations() {
+        let first_data = unsafe { host_alloc(1, align_of::<u8>()) };
+        let second_data = unsafe { host_alloc(1, align_of::<u8>()) };
+        assert!(!first_data.is_null());
+        assert!(!second_data.is_null());
+        unsafe {
+            *first_data = b'a';
+            *second_data = b'b';
+        }
+        let layout = Layout::array::<OptionalOwnedBufferV1>(2).unwrap();
+        let items =
+            unsafe { host_alloc(layout.size(), layout.align()) }.cast::<OptionalOwnedBufferV1>();
+        unsafe {
+            ptr::write(
+                items,
+                OptionalOwnedBufferV1 {
+                    value: OwnedBufferV1 {
+                        data: first_data,
+                        len: 1,
+                    },
+                    present: 2,
+                },
+            );
+            ptr::write(
+                items.add(1),
+                OptionalOwnedBufferV1 {
+                    value: OwnedBufferV1 {
+                        data: second_data,
+                        len: 1,
+                    },
+                    present: 1,
+                },
+            );
+        }
+
+        let result = take_optional_buffer_array(OptionalOwnedBufferArrayV1 { items, len: 2 });
+
+        assert!(matches!(result, Err(CacheError::InvalidData(_))));
+        assert!(!host_allocation_is_registered(first_data));
+        assert!(!host_allocation_is_registered(second_data));
+        assert!(!host_allocation_is_registered(items.cast::<u8>()));
+    }
+
+    #[test]
+    fn checked_reader_rejects_overflow_and_misalignment() {
+        let overflow = claim_allocation::<ScriptValueV1>(
+            std::ptr::NonNull::dangling().as_ptr(),
+            usize::MAX,
+            MAX_HOST_ALLOCATION_BYTES,
+            "overflow array",
+            &mut DecodeBudget::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(overflow, CacheError::InvalidData(message) if message.contains("overflow"))
+        );
+
+        let misaligned = claim_allocation::<ScriptValueV1>(
+            1usize as *mut ScriptValueV1,
+            1,
+            MAX_HOST_ALLOCATION_BYTES,
+            "misaligned array",
+            &mut DecodeBudget::default(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(misaligned, CacheError::InvalidData(message) if message.contains("aligned"))
+        );
     }
 }

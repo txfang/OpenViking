@@ -4,6 +4,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#if defined(_WIN32)
+#define OV_CACHE_PROVIDER_EXPORT __declspec(dllexport)
+#elif defined(__GNUC__) || defined(__clang__)
+#define OV_CACHE_PROVIDER_EXPORT __attribute__((visibility("default")))
+#else
+#define OV_CACHE_PROVIDER_EXPORT
+#endif
+
 #ifdef __cplusplus
 extern "C" {
 #define OV_CACHE_ALIGNOF(type) alignof(type)
@@ -106,15 +114,32 @@ typedef struct {
  *
  * - OpenViking consumes cache.params.library and passes the remaining fields
  *   to create as opaque JSON.
+ * - Input slices and arrays are borrowed only for the duration of the callback.
+ *   The provider must not retain their pointers after the callback returns.
  * - All callbacks use the C ABI. Exceptions and language-runtime panics must
  *   be caught inside the provider library.
  * - A successfully created provider handle must support concurrent calls.
- * - Returned buffers and arrays must use host->alloc with the matching C
- *   alignment. OpenViking releases them with the same size and alignment.
+ * - Every returned buffer, array, and nested item must be a separate,
+ *   non-aliasing allocation created with host->alloc using its exact C size and
+ *   alignment. Extra capacity, interior pointers, shared child buffers, and
+ *   splitting one allocation across multiple returned objects are forbidden.
+ * - Empty buffers and arrays must use the canonical NULL pointer plus zero
+ *   length representation. Unused fields in optional and tagged outputs must
+ *   also use their zero representation.
+ * - On OV_CACHE_STATUS_OK, the error buffer must be empty and every output must
+ *   be fully initialized. On any error status, normal outputs must remain in
+ *   their zero representation and only the error buffer may be returned.
+ * - The provider owns and must release all partially constructed output before
+ *   returning an error. Once a successful output is returned, OpenViking owns
+ *   every allocation and releases it through the matching host allocator.
+ * - host->alloc may reject unreasonable sizes or invalid alignments by
+ *   returning NULL. The provider must handle allocation failure.
  * - create, ping and close are required. Other callbacks are optional; NULL
  *   means that operation is unsupported.
- * - OpenViking waits for in-flight calls before close and unloads the library
- *   only after close returns.
+ * - close is terminal and consumes the provider handle even when it returns an
+ *   error status. It must stop and join provider-owned background work before
+ *   returning. OpenViking never retries close and unloads the library only
+ *   after close returns.
  */
 
 typedef int32_t (*OvCacheProviderCreateV1)(
@@ -310,6 +335,7 @@ typedef struct {
 } OvCacheProviderApiV1;
 
 /* The only symbol resolved by DynamicProvider. */
+OV_CACHE_PROVIDER_EXPORT
 const OvCacheProviderApiV1 *openviking_cache_provider_v1(void);
 
 #ifdef __cplusplus

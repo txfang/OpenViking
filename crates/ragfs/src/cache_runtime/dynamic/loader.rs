@@ -1,7 +1,7 @@
 use super::abi::{ProviderApiV1, ProviderEntryV1, ABI_VERSION_V1, ENTRY_SYMBOL_V1};
 use crate::cache_runtime::{CacheError, CacheResult};
 use libloading::{Library, Symbol};
-use std::mem::size_of;
+use std::mem::{align_of, size_of};
 use std::path::Path;
 use std::ptr;
 
@@ -41,6 +41,12 @@ pub(super) fn load(path: &Path) -> CacheResult<LoadedProviderApi> {
     if api_ptr.is_null() {
         return Err(CacheError::AbiMismatch(format!(
             "dynamic provider {} returned a null API table",
+            path.display()
+        )));
+    }
+    if !(api_ptr as usize).is_multiple_of(align_of::<ProviderApiV1>()) {
+        return Err(CacheError::AbiMismatch(format!(
+            "dynamic provider {} returned a misaligned API table",
             path.display()
         )));
     }

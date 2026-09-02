@@ -33,6 +33,11 @@ name = "redis_runtime"
 path = "tests/redis_runtime.rs"
 required-features = ["cache"]
 
+[[test]]
+name = "dynamic_provider"
+path = "tests/dynamic_provider.rs"
+required-features = ["cache"]
+
 [dependencies]
 # Async runtime
 tokio = { version = "1.38", features = ["full"] }

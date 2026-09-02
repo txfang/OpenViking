@@ -177,6 +177,7 @@ fn pathlock_err_to_py(err: PathLockError) -> PyErr {
         }
     }
 }
+use std::fmt;
 use std::fs;
 use std::future::Future;
 use std::time::{Duration, UNIX_EPOCH};
@@ -276,10 +277,20 @@ struct RagfsCacheConfig {
     dynamic: DynamicCacheConfig,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 struct DynamicCacheConfig {
     library: String,
     params: serde_json::Value,
+}
+
+impl fmt::Debug for DynamicCacheConfig {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("DynamicCacheConfig")
+            .field("library", &self.library)
+            .field("params", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -3229,5 +3240,19 @@ mod tests {
             assert!(error.contains(field));
             fs::remove_file(path).unwrap();
         }
+    }
+
+    #[test]
+    fn dynamic_cache_debug_output_redacts_provider_params() {
+        let config = DynamicCacheConfig {
+            library: "/opt/openviking/libprovider.so".to_string(),
+            params: serde_json::json!({"password": "binding-secret"}),
+        };
+
+        let output = format!("{config:?}");
+
+        assert!(output.contains("/opt/openviking/libprovider.so"));
+        assert!(!output.contains("binding-secret"));
+        assert!(output.contains("<redacted>"));
     }
 }
