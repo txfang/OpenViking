@@ -10,7 +10,7 @@
 - **到哪里去（`--to`）**：产物写入的目标目录；
 - **用哪个 Skill（`--skill`）**：一份描述「要编译成什么样」的说明书。
 
-再加上一个可选的 **`--reason`**：给这次编译的补充指令，比如范围、受众、语言、侧重点。Skill 定义了「编译成什么形态」，`--reason` 则在此之上告诉 Agent「这一次具体要什么」。
+再加上一个可选的 **`--instruction`**：给这次编译的补充指令，比如范围、受众、语言、侧重点。Skill 定义了「编译成什么形态」，`--instruction` 则在此之上告诉 Agent「这一次具体要什么」。
 
 剩下的交给 OpenViking。Compile 依赖 [VikingBot](../concepts/15-vikingbot.md)：任务被接受后，VikingBot 会加载你指定的 Skill，以你的身份读取来源，在一个独立的 **Agent Loop** 里自主地阅读、归纳、组织、写页面——就像你雇了一个人，把一堆资料整理成一份干净的知识库，然后把成品交回给你。整个过程是异步的，你可以等它跑完，也可以拿到 `task_id` 之后去做别的事。
 
@@ -23,11 +23,10 @@ ov compile \
   --from viking://resources/research \
   --to viking://resources/research-wiki \
   --skill viking://agent/skills/llm-wiki \
-  --reason "把研究资料整理成便于团队检索的知识库" \
-  --wait
+  --instruction "把研究资料整理成便于团队检索的知识库"
 ```
 
-`--wait` 会一直轮询到任务结束；去掉它就立刻返回一个 `cmp_...` 任务 ID，之后用 `ov task status <id>` 查看进度、用 `ov task cancel <id>` 取消。完整的字段说明、任务生命周期和 HTTP 接口见 [VikingBot API → compile()](../api/24-vikingbot.md#compile)。
+命令会立即返回一个 `cmp_...` 任务 ID，之后用 `ov task status <id>` 查看进度、用 `ov task cancel <id>` 取消。完整的字段说明、任务生命周期和 HTTP 接口见 [Agent Runtime API](../api/23-agent-runtime.md)。
 
 ## 换个 Skill，就换一种产物
 
@@ -42,6 +41,10 @@ Compile 本身不规定「编译成什么」——那由 Skill 决定。同一�
 
 前两个示例还给出了从**导入来源 → 添加 Skill → 执行编译 → 可视化产物**的完整 `ov` 命令，照着做就能得到一张可交互的 HTML 图。
 
+## 不止生成新产物：整理已有记忆
+
+除了用 Skill 把来源材料编译成新的知识产物，`ov compile` 还有一种特殊模式——把 `--skill` 设为 `memory`，即可对已有的**记忆**目录做就地整理（去重、合并、拆分、精简），且不经过 VikingBot。详见 [记忆整理](./06-memory-consolidation.md)。
+
 ## 前置条件
 
 - 一个正在运行、且启用了 Bot（`--with-bot`）的 OpenViking 服务。默认端点是 `http://localhost:1933`；远程使用需要 API Key，参见 [鉴权](../guides/04-authentication.md)。没有服务先看 [快速开始](../getting-started/02-quickstart.md)。
@@ -51,5 +54,5 @@ Compile 本身不规定「编译成什么」——那由 Skill 决定。同一�
 ## 相关文档
 
 - [VikingBot 概念](../concepts/15-vikingbot.md) — Compile 背后的执行体
-- [VikingBot API](../api/24-vikingbot.md) — `compile()` / `compile_status()` / `compile_cancel()` 的完整参考
+- [Agent Runtime API](../api/23-agent-runtime.md) — 创建、查询和取消 Compile 任务的完整参考
 - [Skills API](../api/04-skills.md) — 如何管理和自定义 Skill

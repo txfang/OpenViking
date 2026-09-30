@@ -6,7 +6,7 @@ import asyncio
 import math
 from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Request
 from fastapi import Response as FastAPIResponse
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -43,6 +43,7 @@ from openviking.utils.search_filters import (
     merge_search_filter,
 )
 from openviking.utils.tags import build_search_tags_filter
+from openviking.utils.time_decay import validate_event_time_decay_request
 from openviking_cli.exceptions import InvalidArgumentError, NotFoundError
 
 
@@ -138,6 +139,15 @@ class FindRequest(BaseModel):
     level: Optional[Union[int, str, List[int]]] = None
     read_content: bool = False
     telemetry: TelemetryRequest = False
+    events_time_decay_protection: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _validate_time_decay(self) -> "FindRequest":
+        validate_event_time_decay_request(self.events_time_decay_protection)
+        if self.events_time_decay_protection is not None:
+            if not self.query.strip() and not self.image_url:
+                raise ValueError("events_time_decay_protection requires a semantic query or image")
+        return self
 
 
 def _reject_unknown_categories(value: Any, label: str, allowed: Sequence[str]) -> None:
@@ -172,6 +182,29 @@ CONTEXT_ONLY_FIELDS = (
 )
 
 
+def context_only_fields_error(supplied_fields, as_named_by_caller=None) -> Optional[str]:
+    """The refusal for context-only arguments in list mode, or None if there is nothing to refuse.
+
+    Both faces of search have to answer the same way here, and both used to carry their
+    own copy of the field list and the wording. The MCP tool never builds a
+    ``SearchRequest`` -- it calls ``SearchService.search`` directly -- so it cannot inherit
+    the validator; it can inherit this.
+
+    ``as_named_by_caller`` maps a field in ``CONTEXT_ONLY_FIELDS`` to the spellings the
+    caller actually used, for a face that exposes one of them under more than one name --
+    and a caller can set more than one of those at once. Telling somebody who passed
+    ``detail_by_category`` that ``detail`` is the problem is not an improvement on having
+    no error at all.
+    """
+    used = sorted(set(CONTEXT_ONLY_FIELDS) & set(supplied_fields))
+    if not used:
+        return None
+    names = sorted(
+        {name for field in used for name in ((as_named_by_caller or {}).get(field) or {field})}
+    )
+    return f"{', '.join(names)} require mode='context'; set mode='context' or drop these fields"
+
+
 class SearchRequest(BaseModel):
     """Request model for search with session.
 
@@ -200,6 +233,7 @@ class SearchRequest(BaseModel):
     level: Optional[Union[int, str, List[int]]] = None
     read_content: bool = False
     telemetry: TelemetryRequest = False
+    events_time_decay_protection: Optional[str] = None
 
     mode: Literal["list", "context"] = "list"
 
@@ -217,13 +251,11 @@ class SearchRequest(BaseModel):
 
     @model_validator(mode="after")
     def _validate_mode(self) -> "SearchRequest":
+        validate_event_time_decay_request(self.events_time_decay_protection)
         if self.mode == "list":
-            used = sorted(set(CONTEXT_ONLY_FIELDS) & self.model_fields_set)
-            if used:
-                raise ValueError(
-                    f"{', '.join(used)} require mode='context'; "
-                    "set mode='context' or drop these fields"
-                )
+            error = context_only_fields_error(self.model_fields_set)
+            if error:
+                raise ValueError(error)
             return self
 
         if self.read_content:
@@ -310,6 +342,8 @@ class GrepRequest(BaseModel):
     level_limit: int = 10
     tags: Optional[List[str]] = None
     include_tags: bool = False
+    before_context: int = Field(default=0, ge=0)
+    after_context: int = Field(default=0, ge=0)
 
 
 class GlobRequest(BaseModel):
@@ -326,6 +360,7 @@ class GlobRequest(BaseModel):
 @router.post("/find")
 async def find(
     request: FindRequest,
+    http_request: Request,
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Semantic search without session context."""
@@ -353,6 +388,7 @@ async def find(
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
             image_url=resolved_image_url,
+            events_time_decay_protection=request.events_time_decay_protection,
         ),
     )
     result = execution.result
@@ -361,6 +397,7 @@ async def find(
     if request.read_content:
         result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
+    http_request.state.retrieval_result_count = result.get("total", 0)
     return Response(
         status="ok",
         result=result,
@@ -385,6 +422,7 @@ async def _search_context(
     service: Any,
     ctx: RequestContext,
     request: SearchRequest,
+    http_request: Request,
     effective_filter: Optional[Dict[str, Any]],
     actual_limit: int,
 ):
@@ -395,6 +433,7 @@ async def _search_context(
         limit=actual_limit,
         score_threshold=request.score_threshold,
         filter=effective_filter,
+        events_time_decay_protection=request.events_time_decay_protection,
         session_id=request.session_id,
         query_expansion=request.query_expansion,
         max_tokens=request.max_tokens,
@@ -417,6 +456,7 @@ async def _search_context(
     ignored = _context_ignored_fields(request)
     if ignored:
         result.stats["ignored"] = ignored
+    http_request.state.retrieval_result_count = len(result.entries)
     return Response(
         status="ok",
         result=_sanitize_floats(result.to_dict()),
@@ -427,6 +467,7 @@ async def _search_context(
 @router.post("/search")
 async def search(
     request: SearchRequest,
+    http_request: Request,
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Semantic search with optional session context."""
@@ -445,6 +486,7 @@ async def search(
             service=service,
             ctx=_ctx,
             request=request,
+            http_request=http_request,
             effective_filter=effective_filter,
             actual_limit=actual_limit,
         )
@@ -467,6 +509,7 @@ async def search(
             filter=effective_filter,
             level=_resolve_levels(request.level) or None,
             image_url=resolved_image_url,
+            events_time_decay_protection=request.events_time_decay_protection,
         )
 
     execution = await run_operation(
@@ -480,6 +523,7 @@ async def search(
     if request.read_content:
         result = await _inline_read_content(result, service=service, ctx=_ctx)
     result = _sanitize_floats(result)
+    http_request.state.retrieval_result_count = result.get("total", 0)
     return Response(
         status="ok",
         result=result,
@@ -538,6 +582,8 @@ async def grep(
             level_limit=request.level_limit,
             tags=request.tags,
             include_tags=request.include_tags,
+            before_context=request.before_context,
+            after_context=request.after_context,
         )
     except AGFSNotFoundError:
         raise NotFoundError(resolved_uri, "file")

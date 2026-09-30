@@ -1,3 +1,6 @@
+// Copyright (c) 2026 Beijing Volcano Engine Technology Co., Ltd.
+// SPDX-License-Identifier: AGPL-3.0
+
 /** Arbitrary JSON object returned by APIs without a dedicated result type. */
 export type JsonObject = Record<string, unknown>;
 /** One target URI or multiple target scopes. */
@@ -9,6 +12,8 @@ export type ClientHeaders =
 export type UploadMode = "local" | "shared";
 /** Resource post-ingest processing modes accepted by addResource. */
 export type ProcessingMode = "semantic_and_vectors" | "vectors_only";
+/** Observer response format supported by HTTP observer APIs. */
+export type ObserverFormat = "table" | "json";
 /** Conflict policy accepted when importing an OVPack. */
 export type PackConflictPolicy = "fail" | "overwrite" | "skip";
 /** Vector handling strategy accepted when importing an OVPack. */
@@ -72,8 +77,14 @@ export interface WaitOptions {
   timeout?: number;
   telemetry?: unknown;
 }
+/** Writable direct grants and inheritance mode. */
+export interface AclSpec {
+  acl_mode?: "inherit" | "restricted";
+  entries?: { principal: string; level: "read" | "write" | "manage" }[];
+}
 /** Resource import options. */
 export interface AddResourceOptions extends WaitOptions {
+  acl?: AclSpec;
   to?: string;
   parent?: string;
   createParent?: boolean;
@@ -89,15 +100,16 @@ export interface AddResourceOptions extends WaitOptions {
   processingMode?: ProcessingMode;
   args?: JsonObject;
   tags?: string[];
-  tagMode?: "replace" | "append";
+  tagMode?: "replace" | "append" | "clear";
   extra?: JsonObject;
 }
 /** Content write options. */
 export interface WriteOptions extends WaitOptions {
+  acl?: AclSpec;
   mode?: string;
   processingMode?: ProcessingMode;
   tags?: string[];
-  tagMode?: "replace" | "append";
+  tagMode?: "replace" | "append" | "clear";
   extra?: JsonObject;
 }
 /** One file write in a batch. */
@@ -111,9 +123,15 @@ export interface BatchWriteOperation {
 export interface BatchWriteOptions extends WaitOptions {
   extra?: JsonObject;
 }
+/** Compile request options. */
+export interface CompileOptions {
+  instruction?: string;
+  args?: JsonObject;
+  extra?: JsonObject;
+}
 /** Retrieval tag update options. */
 export interface SetTagsOptions {
-  mode?: "replace" | "append";
+  mode?: "replace" | "append" | "clear";
   recursive?: boolean;
   telemetry?: unknown;
   extra?: JsonObject;
@@ -122,10 +140,10 @@ export interface SetTagsOptions {
 export interface ReindexOptions {
   mode?: string;
   wait?: boolean;
-  dryRun?: boolean;
+  force?: boolean;
   recursive?: boolean;
   tags?: string[];
-  tagMode?: "replace" | "append";
+  tagMode?: "replace" | "append" | "clear";
   extra?: JsonObject;
 }
 /** Semantic retrieval options shared by find and search. */
@@ -145,6 +163,7 @@ export interface FindOptions {
   tags?: string[];
   includeProvenance?: boolean;
   readContent?: boolean;
+  eventsTimeDecayProtection?: string | null;
   extra?: JsonObject;
 }
 /** Session-aware semantic retrieval options. */
@@ -165,6 +184,7 @@ export interface SearchContextOptions {
   since?: string;
   until?: string;
   timeField?: string;
+  eventsTimeDecayProtection?: string | null;
   queryExpansion?: "off" | "auto";
   maxTokens?: number;
   quotas?: Record<string, number>;
@@ -200,10 +220,16 @@ export interface ListOptions {
   recursive?: boolean;
   output?: string;
   absLimit?: number;
+  includeAbstract?: boolean;
+  includeOverview?: boolean;
+  overviewLimit?: number;
   showAllHidden?: boolean;
   nodeLimit?: number;
+  offset?: number;
+  limit?: number;
   sortBy?: "name" | "mtime";
   sortOrder?: "asc" | "desc";
+  extraFields?: Array<"locked" | "id" | "count">;
   tags?: string[];
   includeTags?: boolean;
 }
@@ -211,11 +237,28 @@ export interface ListOptions {
 export interface TreeOptions {
   output?: string;
   absLimit?: number;
+  includeAbstract?: boolean;
+  includeOverview?: boolean;
+  overviewLimit?: number;
   showAllHidden?: boolean;
+  directoriesOnly?: boolean;
   nodeLimit?: number;
   levelLimit?: number;
+  offset?: number;
+  limit?: number;
+  extraFields?: Array<"locked" | "id" | "count">;
   tags?: string[];
   includeTags?: boolean;
+}
+/** Directory listing page with pagination metadata. */
+export interface ListPage {
+  result: unknown[];
+  hasMore: boolean;
+}
+/** Directory tree page with pagination metadata. */
+export interface TreePage {
+  result: JsonObject[];
+  hasMore: boolean;
 }
 /** Session message payload. */
 export interface Message {
@@ -329,6 +372,8 @@ export interface MatchedContext {
   level?: number;
   abstract?: string;
   score?: number;
+  origin_score?: number | null;
+  time_score?: number | null;
   tags?: string[];
   [key: string]: unknown;
 }
@@ -365,6 +410,7 @@ export interface APIErrorInfo {
 export interface ResponseEnvelope<T> {
   status?: string;
   result?: T;
+  has_more?: boolean;
   error?: APIErrorInfo;
   telemetry?: unknown;
   profile?: string[];

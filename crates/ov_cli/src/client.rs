@@ -1,5 +1,5 @@
 use serde::de::DeserializeOwned;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use std::env;
 use std::path::Path;
 
@@ -39,13 +39,15 @@ fn compact_request_body(body: &mut Value) {
 }
 
 fn add_resource_tag_fields(body: &mut Value, tags: &[String], tag_mode: &str) {
-    if tags.is_empty() {
+    if tags.is_empty() && tag_mode != "clear" {
         return;
     }
     let obj = body
         .as_object_mut()
         .expect("add_resource request body must be an object");
-    obj.insert("tags".to_string(), serde_json::json!(tags));
+    if !tags.is_empty() {
+        obj.insert("tags".to_string(), serde_json::json!(tags));
+    }
     obj.insert("tag_mode".to_string(), serde_json::json!(tag_mode));
 }
 
@@ -115,45 +117,14 @@ pub enum SnapshotShowResult {
 pub struct CompileAccepted {
     pub task_id: String,
     pub status: String,
-    pub to: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompileErrorInfo {
-    pub code: String,
-    pub message: String,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompileResult {
-    #[serde(rename = "from")]
-    pub from_uris: Vec<String>,
-    pub to: String,
-    pub skill: String,
-    pub okf_version: String,
     #[serde(default)]
-    pub created: Vec<String>,
+    pub to: Option<String>,
     #[serde(default)]
-    pub updated: Vec<String>,
+    pub task_type: Option<String>,
     #[serde(default)]
-    pub unchanged: Vec<String>,
-    pub page_count: usize,
-    pub link_count: usize,
+    pub stage: Option<String>,
     #[serde(default)]
-    pub warnings: Vec<String>,
-}
-
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct CompileTaskStatus {
-    pub task_id: String,
-    pub status: String,
-    pub stage: String,
-    pub created_at: String,
-    pub updated_at: String,
-    #[serde(default)]
-    pub result: Option<CompileResult>,
-    #[serde(default)]
-    pub error: Option<CompileErrorInfo>,
+    pub resource_id: Option<String>,
 }
 
 #[derive(serde::Serialize)]
@@ -163,9 +134,9 @@ struct CompileCreateRequest<'a> {
     to: &'a str,
     skill: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
-    reason: Option<&'a str>,
+    instruction: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    runtime_timeout_seconds: Option<f64>,
+    args: Option<&'a serde_json::Map<String, Value>>,
 }
 
 // ============ HttpClient ============
@@ -357,21 +328,17 @@ impl HttpClient {
         from_uris: &[String],
         to: &str,
         skill: &str,
-        reason: Option<&str>,
-        runtime_timeout_seconds: Option<f64>,
+        instruction: Option<&str>,
+        args: Option<&serde_json::Map<String, Value>>,
     ) -> Result<CompileAccepted> {
         let body = CompileCreateRequest {
             from_uris,
             to,
             skill,
-            reason,
-            runtime_timeout_seconds,
+            instruction,
+            args,
         };
-        self.post("/bot/v1/compile", &body).await
-    }
-
-    pub async fn get_compile(&self, task_id: &str) -> Result<CompileTaskStatus> {
-        self.get(&format!("/bot/v1/compile/{task_id}"), &[]).await
+        self.post("/api/v1/compile", &body).await
     }
 
     pub async fn read(&self, uri: &str) -> Result<String> {
@@ -414,9 +381,13 @@ impl HttpClient {
         processing_mode: &str,
         tags: Vec<String>,
         tag_mode: &str,
+        acl: Option<Value>,
     ) -> Result<serde_json::Value> {
         let mut body = Self::build_write_body(uri, content, mode, wait, timeout, processing_mode);
         add_resource_tag_fields(&mut body, &tags, tag_mode);
+        if let Some(acl) = acl {
+            body["acl"] = acl;
+        }
         self.post("/api/v1/content/write", &body).await
     }
 
@@ -441,12 +412,20 @@ impl HttpClient {
             .await
     }
 
-    pub async fn acl_set(&self, uri: &str, entries: Vec<Value>) -> Result<Value> {
-        self.put(
-            "/api/v1/acl",
-            &serde_json::json!({"uri": uri, "entries": entries}),
-        )
-        .await
+    pub async fn acl_set(
+        &self,
+        uri: &str,
+        entries: Vec<Value>,
+        acl_mode: Option<String>,
+    ) -> Result<Value> {
+        let mut body = serde_json::json!({"uri": uri});
+        if !entries.is_empty() {
+            body["entries"] = serde_json::Value::Array(entries);
+        }
+        if let Some(acl_mode) = acl_mode {
+            body["acl_mode"] = serde_json::Value::String(acl_mode);
+        }
+        self.put("/api/v1/acl", &body).await
     }
 
     pub async fn acl_grant(&self, uri: &str, principal: &str, level: &str) -> Result<Value> {
@@ -495,7 +474,7 @@ impl HttpClient {
         uri: &str,
         mode: &str,
         wait: bool,
-        dry_run: bool,
+        force: bool,
         tags: Vec<String>,
         tag_mode: &str,
         recursive: bool,
@@ -504,18 +483,14 @@ impl HttpClient {
             "uri": uri,
             "mode": mode,
             "wait": wait,
-            "dry_run": dry_run,
         });
+        if force {
+            body["force"] = serde_json::json!(true);
+        }
         if !recursive {
             body["recursive"] = serde_json::json!(false);
         }
-        if !tags.is_empty() {
-            let obj = body
-                .as_object_mut()
-                .expect("reindex request body must be an object");
-            obj.insert("tags".to_string(), serde_json::json!(tags));
-            obj.insert("tag_mode".to_string(), serde_json::json!(tag_mode));
-        }
+        add_resource_tag_fields(&mut body, &tags, tag_mode);
         self.post("/api/v1/content/reindex", &body).await
     }
 
@@ -585,8 +560,15 @@ impl HttpClient {
         recursive: bool,
         output: &str,
         abs_limit: i32,
+        include_abstract: Option<bool>,
+        include_overview: Option<bool>,
+        overview_limit: i32,
         show_all_hidden: bool,
         node_limit: i32,
+        offset: i32,
+        limit: Option<i32>,
+        sort_by: Option<&str>,
+        sort_order: Option<&str>,
         extra_fields: &[String],
         tags: &[String],
         include_tags: bool,
@@ -597,9 +579,28 @@ impl HttpClient {
             ("recursive".to_string(), recursive.to_string()),
             ("output".to_string(), output.to_string()),
             ("abs_limit".to_string(), abs_limit.to_string()),
+            ("overview_limit".to_string(), overview_limit.to_string()),
             ("show_all_hidden".to_string(), show_all_hidden.to_string()),
             ("node_limit".to_string(), node_limit.to_string()),
         ];
+        if let Some(value) = include_abstract {
+            params.push(("include_abstract".to_string(), value.to_string()));
+        }
+        if let Some(value) = include_overview {
+            params.push(("include_overview".to_string(), value.to_string()));
+        }
+        if offset != 0 {
+            params.push(("offset".to_string(), offset.to_string()));
+        }
+        if let Some(limit) = limit {
+            params.push(("limit".to_string(), limit.to_string()));
+        }
+        if let Some(sort_by) = sort_by {
+            params.push(("sort_by".to_string(), sort_by.to_string()));
+            if let Some(sort_order) = sort_order {
+                params.push(("sort_order".to_string(), sort_order.to_string()));
+            }
+        }
         for field in extra_fields {
             params.push(("extra_fields".to_string(), field.clone()));
         }
@@ -617,9 +618,15 @@ impl HttpClient {
         uri: &str,
         output: &str,
         abs_limit: i32,
+        include_abstract: Option<bool>,
+        include_overview: Option<bool>,
+        overview_limit: i32,
         show_all_hidden: bool,
+        directories_only: bool,
         node_limit: i32,
         level_limit: i32,
+        offset: i32,
+        limit: Option<i32>,
         extra_fields: &[String],
         tags: &[String],
         include_tags: bool,
@@ -631,7 +638,23 @@ impl HttpClient {
             ("show_all_hidden".to_string(), show_all_hidden.to_string()),
             ("node_limit".to_string(), node_limit.to_string()),
             ("level_limit".to_string(), level_limit.to_string()),
+            ("overview_limit".to_string(), overview_limit.to_string()),
         ];
+        if let Some(value) = include_abstract {
+            params.push(("include_abstract".to_string(), value.to_string()));
+        }
+        if let Some(value) = include_overview {
+            params.push(("include_overview".to_string(), value.to_string()));
+        }
+        if directories_only {
+            params.push(("directories_only".to_string(), "true".to_string()));
+        }
+        if offset != 0 {
+            params.push(("offset".to_string(), offset.to_string()));
+        }
+        if let Some(limit) = limit {
+            params.push(("limit".to_string(), limit.to_string()));
+        }
         for field in extra_fields {
             params.push(("extra_fields".to_string(), field.clone()));
         }
@@ -644,11 +667,19 @@ impl HttpClient {
         self.get("/api/v1/fs/tree", &params).await
     }
 
-    pub async fn mkdir(&self, uri: &str, description: Option<&str>) -> Result<serde_json::Value> {
-        let body = match description {
+    pub async fn mkdir(
+        &self,
+        uri: &str,
+        description: Option<&str>,
+        acl: Option<Value>,
+    ) -> Result<serde_json::Value> {
+        let mut body = match description {
             Some(description) => serde_json::json!({ "uri": uri, "description": description }),
             None => serde_json::json!({ "uri": uri }),
         };
+        if let Some(acl) = acl {
+            body["acl"] = acl;
+        }
         self.post("/api/v1/fs/mkdir", &body).await
     }
 
@@ -718,6 +749,7 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
         read_content: bool,
+        events_time_decay_protection: Option<String>,
     ) -> Result<serde_json::Value> {
         let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
@@ -733,6 +765,7 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
             "read_content": read_content.then_some(true),
+            "events_time_decay_protection": events_time_decay_protection,
         });
         compact_request_body(&mut body);
         self.post("/api/v1/search/find", &body).await
@@ -753,6 +786,7 @@ impl HttpClient {
         context_type: Option<Vec<String>>,
         tags: Option<Vec<String>>,
         read_content: bool,
+        events_time_decay_protection: Option<String>,
     ) -> Result<serde_json::Value> {
         let image_url = normalize_image_input(image)?;
         let mut body = serde_json::json!({
@@ -769,6 +803,7 @@ impl HttpClient {
             "context_type": context_type,
             "tags": tags,
             "read_content": read_content.then_some(true),
+            "events_time_decay_protection": events_time_decay_protection,
         });
         compact_request_body(&mut body);
         self.post("/api/v1/search/search", &body).await
@@ -780,6 +815,8 @@ impl HttpClient {
         exclude_uri: Option<String>,
         pattern: &str,
         ignore_case: bool,
+        after_context: i32,
+        before_context: i32,
         node_limit: i32,
         level_limit: i32,
         tags: &[String],
@@ -790,6 +827,8 @@ impl HttpClient {
             "exclude_uri": exclude_uri,
             "pattern": pattern,
             "case_insensitive": ignore_case,
+            "after_context": (after_context > 0).then_some(after_context),
+            "before_context": (before_context > 0).then_some(before_context),
             "node_limit": node_limit,
             "level_limit": level_limit,
             "tags": (!tags.is_empty()).then(|| tags),
@@ -845,6 +884,7 @@ impl HttpClient {
         resource_args: Option<Map<String, Value>>,
         tags: Vec<String>,
         tag_mode: String,
+        acl: Option<Value>,
         show_progress: bool,
         verbose: bool,
     ) -> Result<serde_json::Value> {
@@ -864,6 +904,9 @@ impl HttpClient {
 
         let build_body = |base: serde_json::Value| {
             let mut body = base;
+            if let Some(acl) = &acl {
+                body["acl"] = acl.clone();
+            }
             add_resource_tag_fields(&mut body, &tags, &tag_mode);
             if create_parent {
                 body.as_object_mut()
@@ -1003,94 +1046,52 @@ impl HttpClient {
         &self,
         data: &str,
         wait: bool,
-        timeout: Option<f64>,
         show_progress: bool,
         verbose: bool,
         source_metadata: Option<Value>,
         target_uri: Option<&str>,
+        skills: &[String],
+        list_only: bool,
     ) -> Result<serde_json::Value> {
-        let path_obj = Path::new(data);
-
-        if path_obj.exists() {
-            if path_obj.is_dir() {
-                let zip_file = if show_progress {
-                    self.zip_directory_with_progress(path_obj, verbose, None)?
+        let path = Path::new(data);
+        let mut body = json!({"wait": wait});
+        if !skills.is_empty() {
+            body["skills"] = json!(skills);
+        }
+        if list_only {
+            body["list_only"] = json!(true);
+        }
+        if let Some(target_uri) = target_uri {
+            body["target_uri"] = json!(target_uri);
+        }
+        if let Some(metadata) = source_metadata {
+            body["source_metadata"] = metadata;
+        } else if path.exists() {
+            body["source_metadata"] = json!({"type": "local", "source": data, "path": data});
+        }
+        if path.is_dir() || path.is_file() {
+            let archive = if path.is_dir() {
+                Some(if show_progress {
+                    self.zip_directory_with_progress(path, verbose, None)?
                 } else {
-                    self.zip_directory(path_obj, None)?
-                };
-                let temp_file_id = if show_progress {
-                    self.upload_temp_file_with_progress(zip_file.path(), verbose)
-                        .await?
-                } else {
-                    self.upload_temp_file(zip_file.path()).await?
-                };
-
-                let mut body = serde_json::json!({
-                    "temp_file_id": temp_file_id,
-                    "wait": wait,
-                    "timeout": timeout,
-                });
-                if let Some(source_metadata) = source_metadata.clone() {
-                    body["source_metadata"] = source_metadata;
-                }
-                if let Some(target_uri) = target_uri {
-                    body["target_uri"] = serde_json::Value::String(target_uri.to_string());
-                }
-                let dynamic_timeout =
-                    TimeoutConfig::for_resource_processing().calculate(zip_file.path())?;
-                self.base
-                    .post_with_timeout("/api/v1/skills", &body, dynamic_timeout)
-                    .await
-            } else if path_obj.is_file() {
-                let temp_file_id = if show_progress {
-                    self.upload_temp_file_with_progress(path_obj, verbose)
-                        .await?
-                } else {
-                    self.upload_temp_file(path_obj).await?
-                };
-
-                let mut body = serde_json::json!({
-                    "temp_file_id": temp_file_id,
-                    "wait": wait,
-                    "timeout": timeout,
-                });
-                if let Some(source_metadata) = source_metadata.clone() {
-                    body["source_metadata"] = source_metadata;
-                }
-                if let Some(target_uri) = target_uri {
-                    body["target_uri"] = serde_json::Value::String(target_uri.to_string());
-                }
-                let dynamic_timeout =
-                    TimeoutConfig::for_resource_processing().calculate(path_obj)?;
-                self.base
-                    .post_with_timeout("/api/v1/skills", &body, dynamic_timeout)
-                    .await
+                    self.zip_directory(path, None)?
+                })
             } else {
-                let mut body = serde_json::json!({
-                    "data": data,
-                    "wait": wait,
-                    "timeout": timeout,
-                });
-                if let Some(source_metadata) = source_metadata.clone() {
-                    body["source_metadata"] = source_metadata;
-                }
-                if let Some(target_uri) = target_uri {
-                    body["target_uri"] = serde_json::Value::String(target_uri.to_string());
-                }
-                self.post("/api/v1/skills", &body).await
-            }
+                None
+            };
+            let upload = archive.as_ref().map(|file| file.path()).unwrap_or(path);
+            let id = if show_progress {
+                self.upload_temp_file_with_progress(upload, verbose).await?
+            } else {
+                self.upload_temp_file(upload).await?
+            };
+            body["temp_file_id"] = json!(id);
+            let dynamic_timeout = TimeoutConfig::for_resource_processing().calculate(upload)?;
+            self.base
+                .post_with_timeout("/api/v1/skills", &body, dynamic_timeout)
+                .await
         } else {
-            let mut body = serde_json::json!({
-                "data": data,
-                "wait": wait,
-                "timeout": timeout,
-            });
-            if let Some(source_metadata) = source_metadata {
-                body["source_metadata"] = source_metadata;
-            }
-            if let Some(target_uri) = target_uri {
-                body["target_uri"] = serde_json::Value::String(target_uri.to_string());
-            }
+            body["data"] = json!(data);
             self.post("/api/v1/skills", &body).await
         }
     }
@@ -1307,20 +1308,12 @@ impl HttpClient {
     // ============ Task Methods ============
 
     pub async fn get_task(&self, task_id: &str) -> Result<serde_json::Value> {
-        let path = if task_id.starts_with("cmp_") {
-            format!("/bot/v1/compile/{task_id}")
-        } else {
-            format!("/api/v1/tasks/{task_id}")
-        };
+        let path = format!("/api/v1/tasks/{task_id}");
         self.get(&path, &[]).await
     }
 
     pub async fn cancel_task(&self, task_id: &str) -> Result<serde_json::Value> {
-        let path = if task_id.starts_with("cmp_") {
-            format!("/bot/v1/compile/{task_id}/cancel")
-        } else {
-            format!("/api/v1/tasks/{task_id}/cancel")
-        };
+        let path = format!("/api/v1/tasks/{task_id}/cancel");
         self.post(&path, &serde_json::json!({})).await
     }
 
@@ -2087,6 +2080,7 @@ mod tests {
                 None,
                 Vec::new(),
                 "replace".to_string(),
+                None,
                 false,
                 false,
             )
@@ -2123,6 +2117,7 @@ mod tests {
                 Some(no_split_args),
                 Vec::new(),
                 "replace".to_string(),
+                None,
                 false,
                 false,
             )
@@ -2174,6 +2169,17 @@ mod tests {
         let obj = body.as_object().unwrap();
         assert!(!obj.contains_key("tags"));
         assert!(!obj.contains_key("tag_mode"));
+    }
+
+    #[test]
+    fn add_resource_tag_fields_sends_clear_without_tags() {
+        let mut body = json!({"path": "https://example.com/demo.md"});
+
+        super::add_resource_tag_fields(&mut body, &[], "clear");
+
+        let obj = body.as_object().unwrap();
+        assert!(!obj.contains_key("tags"));
+        assert_eq!(body["tag_mode"], json!("clear"));
     }
 
     #[test]
@@ -2301,14 +2307,75 @@ mod tests {
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
-            .ls("viking://resources", false, false, "agent", 256, false, 1, &[], &[], false)
+            .ls(
+                "viking://resources",
+                false,
+                false,
+                "agent",
+                256,
+                Some(false),
+                Some(true),
+                512,
+                false,
+                20,
+                4,
+                Some(5),
+                Some("mtime"),
+                Some("desc"),
+                &[],
+                &[],
+                false,
+            )
             .await
             .expect("ls request should succeed");
 
         let request = request_rx.await.expect("request should be captured");
         assert!(request.starts_with("GET /api/v1/fs/ls?"));
+        assert!(request.contains("node_limit=20"));
+        assert!(request.contains("offset=4"));
+        assert!(request.contains("limit=5"));
+        assert!(request.contains("sort_by=mtime"));
+        assert!(request.contains("sort_order=desc"));
+        assert!(request.contains("include_abstract=false"));
+        assert!(request.contains("include_overview=true"));
+        assert!(request.contains("overview_limit=512"));
         assert!(!request.contains("tz="));
         assert!(!request.contains("include_mod_time_iso="));
+
+        let (default_url, default_request_rx) = spawn_request_capture_server().await;
+        let default_client = HttpClient::new(default_url, None, None, None, None, 5.0, false, None);
+        default_client
+            .ls(
+                "viking://resources",
+                false,
+                false,
+                "agent",
+                256,
+                None,
+                None,
+                4000,
+                false,
+                20,
+                0,
+                None,
+                None,
+                None,
+                &[],
+                &[],
+                false,
+            )
+            .await
+            .expect("default ls request should succeed");
+        let default_request = default_request_rx
+            .await
+            .expect("default request should be captured");
+        assert!(!default_request.contains("offset="));
+        assert!(!default_request.contains("include_abstract="));
+        assert!(!default_request.contains("include_overview="));
+        assert!(default_request.contains("overview_limit=4000"));
+        assert!(!default_request.contains("&limit="));
+        assert!(!default_request.contains("sort_by="));
+        assert!(!default_request.contains("sort_order="));
     }
 
     #[tokio::test]
@@ -2448,14 +2515,68 @@ mod tests {
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
 
         client
-            .tree("viking://resources", "agent", 256, false, 1, 3, &[], &[], false)
+            .tree(
+                "viking://resources",
+                "agent",
+                256,
+                Some(false),
+                Some(true),
+                512,
+                false,
+                true,
+                20,
+                3,
+                4,
+                Some(5),
+                &[],
+                &[],
+                false,
+            )
             .await
             .expect("tree request should succeed");
 
         let request = request_rx.await.expect("request should be captured");
         assert!(request.starts_with("GET /api/v1/fs/tree?"));
+        assert!(request.contains("node_limit=20"));
+        assert!(request.contains("offset=4"));
+        assert!(request.contains("limit=5"));
+        assert!(request.contains("include_abstract=false"));
+        assert!(request.contains("include_overview=true"));
+        assert!(request.contains("overview_limit=512"));
+        assert!(request.contains("directories_only=true"));
         assert!(!request.contains("tz="));
         assert!(!request.contains("include_mod_time_iso="));
+
+        let (default_url, default_request_rx) = spawn_request_capture_server().await;
+        let default_client = HttpClient::new(default_url, None, None, None, None, 5.0, false, None);
+        default_client
+            .tree(
+                "viking://resources",
+                "agent",
+                256,
+                None,
+                None,
+                4000,
+                false,
+                false,
+                20,
+                3,
+                0,
+                None,
+                &[],
+                &[],
+                false,
+            )
+            .await
+            .expect("default tree request should succeed");
+        let default_request = default_request_rx
+            .await
+            .expect("default request should be captured");
+        assert!(!default_request.contains("offset="));
+        assert!(!default_request.contains("include_abstract="));
+        assert!(!default_request.contains("include_overview="));
+        assert!(!default_request.contains("directories_only="));
+        assert!(!default_request.contains("&limit="));
     }
 
     #[tokio::test]
@@ -2469,6 +2590,8 @@ mod tests {
                 None,
                 "needle",
                 false,
+                0,
+                0,
                 10,
                 3,
                 &[],
@@ -2481,6 +2604,8 @@ mod tests {
         assert!(request.starts_with("POST /api/v1/search/grep "));
         assert!(!request.contains(r#""tags""#));
         assert!(!request.contains(r#""include_tags""#));
+        assert!(!request.contains(r#""after_context""#));
+        assert!(!request.contains(r#""before_context""#));
     }
 
     #[tokio::test]
@@ -2494,6 +2619,8 @@ mod tests {
                 None,
                 "needle",
                 false,
+                2,
+                3,
                 10,
                 3,
                 &[],
@@ -2504,6 +2631,8 @@ mod tests {
 
         let request = request_rx.await.expect("request should be captured");
         assert!(request.contains(r#""include_tags":true"#));
+        assert!(request.contains(r#""after_context":2"#));
+        assert!(request.contains(r#""before_context":3"#));
     }
 
     #[tokio::test]
@@ -2555,7 +2684,9 @@ mod tests {
             let mut buffer = vec![0; 4096];
             let read = stream.read(&mut buffer).await.expect("request should read");
             let request = String::from_utf8_lossy(&buffer[..read]);
-            assert!(request.contains(r#""runtime_timeout_seconds":86400.0"#));
+            assert!(request.contains(r#""skill":"viking://agent/skills/wiki""#));
+            assert!(request.contains(r#""instruction":"Keep supporting evidence.""#));
+            assert!(request.contains(r#""args":{"model_name":"endpoint-1"}"#));
             let body = r#"{"status":"ok","result":{"task_id":"cmp_1","status":"accepted","to":"viking://resources/wiki"}}"#;
             let response = format!(
                 "HTTP/1.1 202 Accepted\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
@@ -2577,13 +2708,14 @@ mod tests {
             false,
             None,
         );
+        let args = serde_json::json!({"model_name": "endpoint-1"});
         let accepted = client
             .create_compile(
                 &["viking://resources/source".into()],
                 "viking://resources/wiki",
                 "viking://agent/skills/wiki",
-                None,
-                Some(86_400.0),
+                Some("Keep supporting evidence."),
+                args.as_object(),
             )
             .await
             .expect("202 response body should deserialize");
@@ -2591,7 +2723,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn task_methods_route_compile_ids_to_compile_endpoints() {
+    async fn task_methods_use_generic_task_endpoints_for_compile_ids() {
         let (base_url, status_request_rx) = spawn_request_capture_server().await;
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
         client
@@ -2601,7 +2733,7 @@ mod tests {
         let status_request = status_request_rx
             .await
             .expect("status request should be captured");
-        assert!(status_request.starts_with("GET /bot/v1/compile/cmp_1 "));
+        assert!(status_request.starts_with("GET /api/v1/tasks/cmp_1 "));
 
         let (base_url, cancel_request_rx) = spawn_request_capture_server().await;
         let client = HttpClient::new(base_url, None, None, None, None, 5.0, false, None);
@@ -2612,7 +2744,7 @@ mod tests {
         let cancel_request = cancel_request_rx
             .await
             .expect("cancel request should be captured");
-        assert!(cancel_request.starts_with("POST /bot/v1/compile/cmp_1/cancel "));
+        assert!(cancel_request.starts_with("POST /api/v1/tasks/cmp_1/cancel "));
     }
 
     #[tokio::test]

@@ -46,6 +46,7 @@ pub async fn write(
     processing_mode: &str,
     tags: Vec<String>,
     tag_mode: &str,
+    acl: Option<serde_json::Value>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -59,6 +60,7 @@ pub async fn write(
             processing_mode,
             tags,
             tag_mode,
+            acl,
         )
         .await?;
     crate::output::output_success(result, output_format, compact);
@@ -85,7 +87,7 @@ pub async fn reindex(
     uri: &str,
     mode: &str,
     wait: bool,
-    dry_run: bool,
+    force: bool,
     tags: Vec<String>,
     tag_mode: &str,
     recursive: bool,
@@ -93,7 +95,7 @@ pub async fn reindex(
     compact: bool,
 ) -> Result<()> {
     let result = client
-        .reindex(uri, mode, wait, dry_run, tags, tag_mode, recursive)
+        .reindex(uri, mode, wait, force, tags, tag_mode, recursive)
         .await?;
     crate::output::output_success(result, output_format, compact);
     Ok(())

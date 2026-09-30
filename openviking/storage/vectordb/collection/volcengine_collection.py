@@ -10,8 +10,8 @@ from openviking.storage.vectordb.collection.result import (
     AggregateResult,
     DataItem,
     FetchDataInCollectionResult,
-    SearchItemResult,
     SearchResult,
+    parse_remote_search_result,
 )
 from openviking.storage.vectordb.collection.volcengine_clients import (
     VIKING_DB_VERSION,
@@ -274,19 +274,24 @@ class VolcengineCollection(ICollection):
             normalized["op"] = "time_range"
         return normalized
 
-    def _data_post(self, path: str, data: Dict[str, Any]):
+    def _data_post(self, path: str, data: Dict[str, Any], *, raise_for_status: bool = False):
         # Centralized sanitization at the request exit, covering all data API inputs
         safe_data = self._sanitize_payload(data)
         if isinstance(safe_data, dict) and "filter" in safe_data:
             safe_data["filter"] = self._normalize_date_time_filter(safe_data["filter"])
         response = self.data_client.do_req("POST", path, req_body=safe_data)
         if response.status_code != 200:
-            logger.error(f"Request to {path} failed: {response.text}")
+            error = self._build_response_error(response, path)
+            logger.error(str(error))
+            if raise_for_status:
+                raise error
             return {}
         try:
             result = response.json()
             return result.get("result", {})
         except json.JSONDecodeError:
+            if raise_for_status:
+                raise ConnectionError(f"Request to {path} failed: invalid JSON response")
             return {}
 
     def _data_get(self, path: str, params: Dict[str, Any]):
@@ -371,7 +376,7 @@ class VolcengineCollection(ICollection):
             "CollectionName": self.collection_name,
             "IndexName": index_name,
         }
-        if scalar_index:
+        if scalar_index is not None:
             data["ScalarIndex"] = scalar_index
         if description is not None:
             data["Description"] = description
@@ -462,18 +467,7 @@ class VolcengineCollection(ICollection):
         return result
 
     def _parse_search_result(self, data: Dict[str, Any]) -> SearchResult:
-        result = SearchResult()
-        if isinstance(data, dict) and "data" in data:
-            data_list = data.get("data", [])
-            result.data = [
-                SearchItemResult(
-                    id=item.get("id"),
-                    fields=item.get("fields"),
-                    score=item.get("score"),
-                )
-                for item in data_list
-            ]
-        return result
+        return parse_remote_search_result(data)
 
     def search_by_vector(
         self,
@@ -484,6 +478,8 @@ class VolcengineCollection(ICollection):
         filters: Optional[Dict[str, Any]] = None,
         sparse_vector: Optional[Dict[str, float]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
+        return_detail_info: bool = False,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/vector"
         data = {
@@ -499,6 +495,10 @@ class VolcengineCollection(ICollection):
         }
         if sparse_vector:
             data["sparse_vector"] = sparse_vector
+        if advance is not None:
+            data["advance"] = advance
+        if return_detail_info:
+            data["return_detail_info"] = True
         resp_data = self._data_post(path, data)
         return self._parse_search_result(resp_data)
 
@@ -561,6 +561,7 @@ class VolcengineCollection(ICollection):
         offset: int = 0,
         filters: Optional[Dict[str, Any]] = None,
         output_fields: Optional[List[str]] = None,
+        advance: Optional[Dict[str, Any]] = None,
     ) -> SearchResult:
         path = "/api/vikingdb/data/search/random"
         data = {
@@ -573,7 +574,9 @@ class VolcengineCollection(ICollection):
             "offset": offset,
             "ignore_unknown_fields": True,
         }
-        resp_data = self._data_post(path, data)
+        if advance is not None:
+            data["advance"] = advance
+        resp_data = self._data_post(path, data, raise_for_status=True)
         return self._parse_search_result(resp_data)
 
     def search_by_keywords(

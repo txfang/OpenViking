@@ -223,7 +223,7 @@ Write a file and automatically refresh related semantics and vectors.
 | wait | bool | No | `false` | Wait for background semantic/vector refresh |
 | timeout | float | No | `null` | Timeout in seconds when `wait=true` |
 | tags | string[] | No | Unset | Explicit retrieval tags for the written file, for example `["team=search", "env=prod"]` |
-| tag_mode | string | No | `replace` | Tag update mode when `tags` is supplied: `replace` overwrites tags; `append` merges tags by key |
+| tag_mode | string | No | `replace` | Tag update mode: `replace` overwrites tags, `append` merges by key, and `clear` removes existing tags without requiring `tags` |
 
 **Notes**
 
@@ -231,8 +231,9 @@ Write a file and automatically refresh related semantics and vectors.
 - Explicit `create` only accepts text-writable extensions: `.md`, `.txt`, `.json`, `.yaml`, `.yml`, `.toml`, `.py`, `.js`, `.ts`. Parent directories are created automatically for every write mode.
 - Existing `.abstract.md` and `.overview.md` bodies may be updated, but public APIs cannot create them. A body-only request preserves stored OKF metadata; a full-OKF request must match the stored metadata. Unknown metadata fields are silently dropped. A sidecar body write rebuilds only the directory's existing L0/L1 vectors and does not regenerate semantics.
 - File content is updated before the API returns. `wait` only controls whether the call waits for semantic/vector refresh to finish.
-- The public API no longer accepts `regenerate_semantics` or `revectorize`; write always refreshes related semantics and vectors.
-- When `tags` is supplied, tags are included in the file's first vector upsert rather than updated after processing. Omitting `tags` preserves existing tags; explicit `tags: []` with `tag_mode: "replace"` clears them.
+- The public API no longer accepts `regenerate_semantics` or `revectorize`; write automatically schedules related semantic and vector processing.
+- Parent L0/L1 refreshes for resource writes are best-effort: a parent lock conflict skips that directory refresh while preserving the file write and its own summary/vector work. Skipping L0/L1 persistence also skips directory vector updates; a later refresh is not guaranteed. Locks on the written file itself still raise conflicts. Contention detected before enqueueing returns `semantic_status: "skipped"`; skips during background execution are logged, and `wait=true` does not guarantee updated parent summaries.
+- When non-empty `tags` are supplied, tags are included in the file's first vector upsert rather than updated after processing. Omitting `tags`, or using `tags: []` with `tag_mode: "replace"`, preserves existing tags. Use `tag_mode: "clear"` to remove all existing tags; `clear` ignores any supplied tag values.
 
 
 **Python SDK**
@@ -242,7 +243,6 @@ result = client.write(
     uri="viking://resources/docs/api.md",
     content="# Updated API\n\nFresh content.",
     mode="replace",
-    wait=True,
     options={"tags": ["team=search", "env=prod"], "tag_mode": "replace"},
 )
 print(result["root_uri"])
@@ -252,7 +252,6 @@ print(result["root_uri"])
 
 ```typescript
 await client.write("viking://resources/docs/new.md", "# New document\n", {
-  wait: true,
   tags: ["team=search", "env=prod"],
   tagMode: "replace",
 });
@@ -267,7 +266,6 @@ result, err := client.Write(
     "# Updated API\n\nFresh content.",
     &openviking.WriteOptions{
         Mode: "replace",
-        Wait: true,
         Tags: []string{"team=search", "env=prod"},
         TagMode: "replace",
     },
@@ -292,7 +290,6 @@ curl -X POST "http://localhost:1933/api/v1/content/write" \
     "uri": "viking://resources/docs/api.md",
     "content": "# Updated API\n\nFresh content.",
     "mode": "replace",
-    "wait": true,
     "tags": ["team=search", "env=prod"],
     "tag_mode": "replace"
   }'
@@ -304,8 +301,7 @@ curl -X POST "http://localhost:1933/api/v1/content/write" \
 openviking write viking://resources/docs/api.md \
   --content "# Updated API\n\nFresh content." \
   --tags team=search,env=prod \
-  --tag-mode replace \
-  --wait
+  --tag-mode replace
 ```
 
 
@@ -370,10 +366,11 @@ Each operation contains:
 - All targets must be files below `root_uri`, use the same context type, and have unique canonical URIs.
 - Resource targets may use any safe file extension; Memory targets retain the text extension allowlist and do not accept binary content.
 - `replace`, `append`, and `create` match `write()` semantics. `upsert` replaces an existing file or creates a missing file.
-- The batch holds one target tree lock while writing. Semantic processing starts only after every file is written and the lock is released, so `.overview.md` and `.abstract.md` are refreshed once for the batch.
+- The batch acquires exact locks for all target files before validating file state and writing. Writes to disjoint files in the same directory can proceed concurrently; overlapping writes and parent-directory deletion or moves still conflict. Semantic processing starts after all writes finish and the locks are released, refreshing the affected `.overview.md` and `.abstract.md` files together.
+- Resource parent refreshes use the same best-effort behavior as `write()`: L0/L1 lock conflicts skip the directory refresh and its vector updates while preserving file writes and file processing. A later refresh is not guaranteed.
 - An underlying I/O failure can still leave writes completed earlier in the batch visible.
 - Existing `.abstract.md` and `.overview.md` bodies may be replaced or appended. OpenViking preserves and validates protected OKF metadata and rebuilds only the directory's existing L0/L1 vectors for these operations.
-- In the response body, `semantic_status` (`queued`, `complete`, or `deferred`) reports the directory aggregation status, while `vector_status` reports vector maintenance for changed files.
+- In the response body, `semantic_status` (`queued`, `complete`, `deferred`, or `skipped`) reports the directory aggregation status; it is `skipped` if any directory encounters contention before enqueueing. Meanwhile, `vector_status` reports vector maintenance for changed files.
 
 **Python SDK**
 
@@ -392,7 +389,7 @@ result = client.batch_write(
             "mode": "upsert",
         },
     ],
-    wait=True,
+    wait=False,
 )
 ```
 
@@ -415,7 +412,7 @@ curl -X POST http://localhost:1933/api/v1/content/batch-write \
         "mode": "upsert"
       }
     ],
-    "wait": true
+    "wait": false
   }'
 ```
 
@@ -491,7 +488,7 @@ Content-Disposition: attachment; filename*=UTF-8''logo.png
 
 ### set_tags()
 
-Set explicit `k=v` tags used by retrieval filters. Both key and value are non-empty, contain exactly one `=`, are made only of lowercase letters, digits, `_`, `-`, `.` and start with a letter or digit (the server trims whitespace and lowercases); the key is capped at 64 and the value at 128 characters, and invalid tags are rejected. `replace` replaces existing tags, while `append` adds tags. When the target is a directory, `recursive=true` applies the update to files below it.
+Set explicit `k=v` tags used by retrieval filters. `replace` replaces existing tags, `append` adds tags, and `clear` explicitly removes existing tags. When the target is a directory, `recursive=true` applies the update to files below it. Omitting `tags`, or passing an empty list with `replace`, is a no-op; only `clear` removes tags and it ignores any supplied tag values.
 
 **Python SDK**
 
@@ -586,7 +583,7 @@ ov set-tags viking://resources/project/ \
 
 ### reindex()
 
-Reindex semantic and/or vector artifacts for existing content already stored in OpenViking. This is an operational maintenance API intended for scenarios such as embedding model changes, VLM changes, vector store rebuild, or post-upgrade repair of existing indexes.
+Validate and repair semantic and/or vector artifacts for existing content already stored in OpenViking. Resource and skill targets use incremental RFV (Request / Formal / Vector) convergence by default: unchanged file fingerprints, directory L0/L1 visible-body fingerprints, and request scalars are skipped. Use `force=true` for an unconditional rebuild.
 
 This API operates on existing `viking://...` content. It does not import new files. For normal ingestion, use [Resources](02-resources.md).
 
@@ -600,14 +597,14 @@ This API operates on existing `viking://...` content. It does not import new fil
 | Parameter | Type | Required | Default | Description |
 |-----------|------|----------|---------|-------------|
 | uri | str | Yes | - | Viking URI to reindex |
-| mode | str | No | `vectors_only` | Reindex mode: `vectors_only`, `semantic_and_vectors`, or `prune_orphans` |
+| mode | str | No | `vectors_only` | Reindex mode: `vectors_only` or `semantic_and_vectors` |
 | wait | bool | No | `true` | Whether to wait for completion |
-| dry_run | bool | No | `false` | Only valid with `mode="prune_orphans"`; report orphan vector records without deleting them |
-| recursive | bool | No | `true` | Whether to process descendants recursively; `false` applies only to `semantic_and_vectors` on a `resource`, `memory`, or `skill` directory |
-| tags | list[str] | No | `null` | Write tags to every successfully rebuilt vector record. Omit to preserve existing tags; an empty list with `replace` clears them |
-| tag_mode | str | No | `replace` | Tag write mode: `replace` or `append` |
+| force | bool | No | `false` | Skip fingerprint equality and reprocess every available resource/skill file and directory level in scope |
+| recursive | bool | No | `true` | Whether to process descendants recursively; both resource/skill rebuild modes honor this option |
+| tags | list[str] | No | `null` | Write tags to every successfully rebuilt vector record. Omitting tags, or passing an empty list with `replace`, preserves existing tags |
+| tag_mode | str | No | `replace` | Tag write mode: `replace`, `append`, or `clear`; `clear` removes existing tags without requiring `tags` |
 
-The HTTP request body rejects unknown fields. `uri` may use OpenViking path variables accepted by other content APIs; it is resolved before validation.
+The HTTP request body ignores unknown fields to preserve compatibility while clients and servers evolve independently. `uri` may use OpenViking path variables accepted by other content APIs; it is resolved before validation.
 
 **Supported URI scopes**
 
@@ -626,19 +623,18 @@ when reindexing a broader user namespace, session subtrees are skipped.
 
 **Modes**
 
-- `vectors_only`: rebuilds vector-store records from currently recoverable source data without rewriting `.abstract.md` or `.overview.md`
-- `semantic_and_vectors`: regenerates semantic artifacts first, then rebuilds vectors from the refreshed semantic outputs
-- `prune_orphans`: deletes vector-store records under the requested URI whose source files no longer exist in the filesystem. With `dry_run=true`, it only reports how many records would be deleted.
+- `vectors_only`: compares current source MD5 values with vector-record MD5 values through RFV and rebuilds only missing or stale L0/L1/L2 records; it does not rewrite `.abstract.md` or `.overview.md`
+- `semantic_and_vectors`: uses the same RFV state and `ContextUpdatePlan` to drive semantic repair and L0/L1/L2 updates, without a second manual vector scan
 
 For `resource` and `skill`, `semantic_and_vectors` refreshes directory/file semantic artifacts, including `.abstract.md` and `.overview.md`. For `memory`, it rebuilds the current persisted memory subtree semantics and vectors, but it does not replay historical extraction order.
 
-For `semantic_and_vectors`, semantic generation and vector rebuilding are sequenced by the reindex executor. The semantic refresh step does not enqueue its own background vectorization work; vectors are rebuilt by the reindex step so `wait=true` reflects the reindex operation itself.
+Resource/skill `vectors_only` and `semantic_and_vectors` share one F traversal and one narrow-field V inventory. Each source is read once during state resolution and that result is reused while executing the plan. `force=true` bypasses MD5 equality but still performs completeness and scope checks.
 
-For a `resource` or `memory` directory, `recursive=false` regenerates only the target directory's `.abstract.md` and `.overview.md`, then rebuilds only that directory's L0/L1 vectors. Child directories do not regenerate semantic artifacts, and neither child directories nor files are re-vectorized. The target aggregation still reads existing summaries from deterministically sampled child directories; sampled direct files are summarized as inputs to the target aggregation. For a `skill` target, `recursive=false` regenerates the skill directory's L0/L1 semantic artifacts and vectors from `SKILL.md`, but does not rebuild the `SKILL.md` L2 vector. This flag does not change existing behavior for `vectors_only`, `prune_orphans`, or namespace targets.
+For a resource/skill directory, `recursive=false` limits both modes to the target directory's own L0/L1 records. Direct children are read only as existing REUSE inputs for the target aggregation; descendants are neither scanned nor rebuilt. Namespace containers have no index records of their own, so namespace targets reject `recursive=false` instead of silently becoming a no-op. Memory remains on the existing reindex path.
 
-For `prune_orphans`, source existence is checked against the filesystem. If an entire directory is missing, vector records for files and semantic sidecars below that directory, such as `.abstract.md` and `.overview.md`, are pruned together. `dry_run` is rejected for other modes.
+When the F snapshot is complete, the RFV diff identifies records present in V but absent from F as orphans and removes them during the same reindex. Deletion fails closed when the F snapshot is incomplete.
 
-When `tags` is provided, tags are included in the same upsert as each vector record produced by reindex; reindex does not call `set_tags` afterwards. Directory and namespace reindex operations apply tags to successfully rebuilt directory L0/L1 and leaf L2 records. `replace` overwrites existing tags, while `append` merges by key. When `tags` is omitted, `tag_mode` is ignored and existing tags remain unchanged. `prune_orphans` produces no vectors and ignores both fields.
+When non-empty `tags` are provided, tags are included in the same upsert as each vector record produced by reindex; reindex does not call `set_tags` afterwards. Directory and namespace reindex operations apply tags to successfully rebuilt directory L0/L1 and leaf L2 records. `replace` overwrites existing tags, while `append` merges by key. `replace` with an empty tag list is a no-op. `clear` removes existing tags and does not require `tags`; if values are supplied with `clear`, they are ignored.
 
 Subtree reindex is not transactional. Records skipped because no semantic source is available, or records whose embedding fails, do not receive the new tags.
 
@@ -648,7 +644,7 @@ Subtree reindex is not transactional. Records skipped because no semantic source
 result = client.reindex(
     uri="viking://resources",
     mode="vectors_only",
-    wait=True,
+    wait=False,
     options={
         "tags": ["team=search", "env=prod"],
         "tag_mode": "replace",
@@ -661,24 +657,17 @@ print(result)
 result = client.reindex(
     uri="viking://user/default/skills",
     mode="semantic_and_vectors",
+    force=True,
     wait=False,
 )
 print(result["status"])
-```
-
-```python
-result = client.reindex(
-    uri="viking://resources",
-    mode="prune_orphans",
-    dry_run=True,
-)
-print(result["would_delete_records"])
 ```
 
 **TypeScript SDK**
 
 ```typescript
 console.log(await client.reindex("viking://resources/docs/", {
+  force: true,
   tags: ["team=search"],
   tagMode: "append",
 }));
@@ -686,13 +675,13 @@ console.log(await client.reindex("viking://resources/docs/", {
 
 **Go SDK**
 
-When passing a non-`nil` `ReindexOptions`, set `Wait` explicitly. Go's zero
-value is `false`; only `opts=nil` applies the SDK default `wait=true`.
+With non-`nil` `ReindexOptions`, omitting `Wait` uses Go's zero value `false`;
+only `opts=nil` applies the SDK default `wait=true`.
 
 ```go
 result, err := client.Reindex(ctx, "viking://resources", &openviking.ReindexOptions{
     Mode: "vectors_only",
-    Wait: true,
+    Force: true,
     Tags: []string{"team=search"},
     TagMode: "replace",
 })
@@ -700,18 +689,6 @@ if err != nil {
     return err
 }
 fmt.Println(result["status"])
-```
-
-```go
-result, err := client.Reindex(ctx, "viking://resources", &openviking.ReindexOptions{
-    Mode: "prune_orphans",
-    Wait: true,
-    DryRun: true,
-})
-if err != nil {
-    return err
-}
-fmt.Println(result["would_delete_records"])
 ```
 
 **HTTP API**
@@ -730,7 +707,8 @@ curl -X POST http://localhost:1933/api/v1/content/reindex \
   -d '{
     "uri": "viking://resources",
     "mode": "vectors_only",
-    "wait": true,
+    "wait": false,
+    "force": true,
     "tags": ["team=search", "env=prod"],
     "tag_mode": "replace"
   }'
@@ -740,40 +718,17 @@ curl -X POST http://localhost:1933/api/v1/content/reindex \
 
 ```bash
 openviking reindex viking://resources --mode vectors_only \
-  --tags team=search,env=prod --tag-mode replace
+  --force --tags team=search,env=prod --tag-mode replace
 ```
 
-The CLI sends tag fields only when non-empty `--tags` is provided. Use HTTP or an SDK to clear tags with `tags: []`.
+Use `--tag-mode clear` without `--tags` to clear existing tags:
+
+```bash
+openviking reindex viking://resources --mode vectors_only --tag-mode clear
+```
 
 ```bash
 openviking reindex viking://user/default/skills --mode semantic_and_vectors --wait false
-```
-
-```bash
-openviking reindex viking://resources --mode prune_orphans --dry-run
-```
-
-**Synchronous response (`wait=true`)**
-
-```json
-{
-  "status": "ok",
-  "result": {
-    "uri": "viking://resources",
-    "mode": "vectors_only",
-    "status": "completed",
-    "object_type": "resource",
-    "scanned_records": 120,
-    "rebuilt_records": 118,
-    "deleted_records": 0,
-    "would_delete_records": 0,
-    "unsupported_records": 2,
-    "failed_records": 0,
-    "duration_ms": 1284,
-    "warnings": []
-  },
-  "time": 0.1
-}
 ```
 
 **Asynchronous response (`wait=false`)**
@@ -818,8 +773,7 @@ Task records are persisted under `/local/{account_id}/_system/tasks/{user_id}/{t
 | mode | Effective reindex mode |
 | scanned_records | Number of records or semantic sources considered |
 | rebuilt_records | Number of vector records successfully rebuilt |
-| deleted_records | Number of vector records deleted by `prune_orphans`; `0` for `dry_run=true` |
-| would_delete_records | Number of vector records that would be deleted by `prune_orphans` in dry-run mode |
+| deleted_records | Number of orphan vector records confirmed and deleted by the RFV diff |
 | unsupported_records | Number of records skipped because no usable vector source was available |
 | failed_records | Number of records that failed while rebuilding |
 | duration_ms | Synchronous run duration in milliseconds |
@@ -829,12 +783,10 @@ Task records are persisted under `/local/{account_id}/_system/tasks/{user_id}/{t
 **Behavior notes**
 
 - `vectors_only` and `semantic_and_vectors` are non-destructive. They use rebuild/upsert behavior and do not require dropping the vector collection first.
-- `prune_orphans` is destructive unless `dry_run=true`: it removes vector records whose source files no longer exist.
 - `viking://` reindex fans out to supported top-level namespaces and excludes `session`.
 - Namespace reindex operations such as `viking://user` propagate to supported child content types.
 - `vectors_only` is the right mode when only the embedding model or vector index needs to be refreshed.
 - `semantic_and_vectors` is the right mode when semantic artifacts themselves must be regenerated before re-vectorization.
-- `prune_orphans` is the right mode when the filesystem has been changed outside normal APIs and the vector store may still contain records for deleted paths.
 - Only one reindex task can run for the same URI and owner at a time. A concurrent request for the same target returns a conflict.
 - For resource files, text files can use file content when no summary is available. Non-text files require a generated summary or existing vector record fallback; otherwise they are counted as unsupported.
 

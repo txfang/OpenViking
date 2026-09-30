@@ -1,4 +1,3 @@
-use crate::CliContext;
 use crate::PrivacyCommands;
 use crate::client;
 use crate::commands;
@@ -10,6 +9,7 @@ use crate::terminal_ui::{
 };
 use crate::theme;
 use crate::tui;
+use crate::{CliContext, SkillAddArgs, UploadCliOptions};
 use colored::Colorize;
 use serde_json::{Map, Value};
 
@@ -33,6 +33,7 @@ pub async fn handle_add_resource(
     resource_args: Option<String>,
     tags: Vec<String>,
     tag_mode: String,
+    acl: Option<Value>,
     ctx: CliContext,
 ) -> Result<()> {
     let is_url =
@@ -123,6 +124,7 @@ pub async fn handle_add_resource(
         add_resource_args,
         tags,
         tag_mode,
+        acl,
         ctx.output_format,
         ctx.compact,
         ctx.should_show_progress(),
@@ -320,23 +322,27 @@ mod add_resource_args_tests {
 }
 
 pub async fn handle_add_skill(
-    data: String,
-    wait: bool,
-    timeout: Option<f64>,
-    parent: Option<String>,
+    args: SkillAddArgs,
+    legacy_upload_options: UploadCliOptions,
     ctx: CliContext,
 ) -> Result<()> {
+    let ctx = ctx.with_upload_options(
+        args.upload_options
+            .merged_with_legacy(legacy_upload_options),
+    );
     let client = ctx.get_client();
-    commands::resources::add_skill(
+    commands::skills::add(
         &client,
-        &data,
-        wait,
-        timeout,
-        parent.as_deref(),
+        &args.source,
+        args.skills,
+        args.list,
+        args.wait,
+        args.yes,
         ctx.should_show_progress(),
         ctx.is_verbose(),
         ctx.output_format,
         ctx.compact,
+        args.parent.as_deref(),
     )
     .await
 }
@@ -1394,6 +1400,7 @@ pub async fn handle_write(
     processing_mode: String,
     tags: Vec<String>,
     tag_mode: String,
+    acl: Option<Value>,
     ctx: CliContext,
 ) -> Result<()> {
     let client = ctx.get_client();
@@ -1417,6 +1424,7 @@ pub async fn handle_write(
         &processing_mode,
         tags,
         &tag_mode,
+        acl,
         ctx.output_format,
         ctx.compact,
     )
@@ -1447,7 +1455,7 @@ pub async fn handle_reindex(
     uri: String,
     mode: String,
     wait: bool,
-    dry_run: bool,
+    force: bool,
     tags: Vec<String>,
     tag_mode: String,
     recursive: bool,
@@ -1459,7 +1467,7 @@ pub async fn handle_reindex(
         &uri,
         &mode,
         wait,
-        dry_run,
+        force,
         tags,
         &tag_mode,
         recursive,
@@ -1486,6 +1494,7 @@ pub async fn handle_find(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1520,6 +1529,9 @@ pub async fn handle_find(
     if read_content {
         params.push("--read-content".to_string());
     }
+    if let Some(ref protection) = events_time_decay_protection {
+        params.push(format!("--events-time-decay-protection {}", protection));
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov find", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1537,6 +1549,7 @@ pub async fn handle_find(
         context_type,
         tags,
         read_content,
+        events_time_decay_protection,
         ctx.output_format,
         ctx.compact,
     )
@@ -1556,6 +1569,7 @@ pub async fn handle_search(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     ctx: CliContext,
 ) -> Result<()> {
     let query = query.unwrap_or_default();
@@ -1593,6 +1607,9 @@ pub async fn handle_search(
     if read_content {
         params.push("--read-content".to_string());
     }
+    if let Some(ref protection) = events_time_decay_protection {
+        params.push(format!("--events-time-decay-protection {}", protection));
+    }
     params.push(format!("\"{}\"", query));
     print_command_echo("ov search", &params.join(" "), ctx.config.echo_command);
     let client = ctx.get_client();
@@ -1611,6 +1628,7 @@ pub async fn handle_search(
         context_type,
         tags,
         read_content,
+        events_time_decay_protection,
         ctx.output_format,
         ctx.compact,
     )
@@ -1642,8 +1660,15 @@ pub async fn handle_ls(
     simple: bool,
     recursive: bool,
     abs_limit: i32,
+    include_abstract: Option<bool>,
+    include_overview: Option<bool>,
+    overview_limit: i32,
     show_all_hidden: bool,
     node_limit: i32,
+    offset: i32,
+    limit: Option<i32>,
+    sort_by: Option<String>,
+    sort_order: Option<String>,
     fields: Option<Vec<String>>,
     tags: Vec<String>,
     ctx: CliContext,
@@ -1659,8 +1684,29 @@ pub async fn handle_ls(
     if recursive {
         params.push("-r".to_string());
     }
+    if let Some(value) = include_abstract {
+        params.push(format!("--include-abstract={value}"));
+    }
+    if let Some(value) = include_overview {
+        params.push(format!("--include-overview={value}"));
+    }
+    if include_overview == Some(true) {
+        params.push(format!("--overview-limit {overview_limit}"));
+    }
     if show_all_hidden {
         params.push("-a".to_string());
+    }
+    if offset != 0 {
+        params.push(format!("--offset {}", offset));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("--limit {}", limit));
+    }
+    if let Some(sort_by) = &sort_by {
+        params.push(format!("--sort-by {}", sort_by));
+    }
+    if let Some(sort_order) = &sort_order {
+        params.push(format!("--sort-order {}", sort_order));
     }
     if !tags.is_empty() {
         params.push(format!("--tags {}", tags.join(",")));
@@ -1676,6 +1722,18 @@ pub async fn handle_ls(
     } else {
         "agent"
     };
+    let include_abstract = include_abstract.or_else(|| {
+        fields
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item == "abstract"))
+            .then_some(true)
+    });
+    let include_overview = include_overview.or_else(|| {
+        fields
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item == "overview"))
+            .then_some(true)
+    });
     commands::filesystem::ls(
         &client,
         &uri,
@@ -1683,8 +1741,15 @@ pub async fn handle_ls(
         recursive,
         api_output,
         abs_limit,
+        include_abstract,
+        include_overview,
+        overview_limit,
         show_all_hidden,
         node_limit,
+        offset,
+        limit,
+        sort_by.as_deref(),
+        sort_order.as_deref(),
         ctx.output_format,
         ctx.compact,
         fields,
@@ -1696,8 +1761,14 @@ pub async fn handle_ls(
 pub async fn handle_tree(
     uri: String,
     abs_limit: i32,
+    include_abstract: Option<bool>,
+    include_overview: Option<bool>,
+    overview_limit: i32,
     show_all_hidden: bool,
+    directories_only: bool,
     node_limit: i32,
+    offset: i32,
+    limit: Option<i32>,
     level_limit: i32,
     simple: bool,
     fields: Option<Vec<String>>,
@@ -1713,8 +1784,26 @@ pub async fn handle_tree(
     if show_all_hidden {
         params.push("-a".to_string());
     }
+    if directories_only {
+        params.push("--directories-only".to_string());
+    }
+    if let Some(value) = include_abstract {
+        params.push(format!("--include-abstract={value}"));
+    }
+    if let Some(value) = include_overview {
+        params.push(format!("--include-overview={value}"));
+    }
+    if include_overview == Some(true) {
+        params.push(format!("--overview-limit {overview_limit}"));
+    }
     if simple {
         params.push("-s".to_string());
+    }
+    if offset != 0 {
+        params.push(format!("--offset {}", offset));
+    }
+    if let Some(limit) = limit {
+        params.push(format!("--limit {}", limit));
     }
     if !tags.is_empty() {
         params.push(format!("--tags {}", tags.join(",")));
@@ -1730,14 +1819,32 @@ pub async fn handle_tree(
     } else {
         "agent"
     };
+    let include_abstract = include_abstract.or_else(|| {
+        fields
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item == "abstract"))
+            .then_some(true)
+    });
+    let include_overview = include_overview.or_else(|| {
+        fields
+            .as_ref()
+            .is_some_and(|items| items.iter().any(|item| item == "overview"))
+            .then_some(true)
+    });
     commands::filesystem::tree(
         &client,
         &uri,
         api_output,
         abs_limit,
+        include_abstract,
+        include_overview,
+        overview_limit,
         show_all_hidden,
+        directories_only,
         node_limit,
         level_limit,
+        offset,
+        limit,
         ctx.output_format,
         ctx.compact,
         simple,
@@ -1747,12 +1854,18 @@ pub async fn handle_tree(
     .await
 }
 
-pub async fn handle_mkdir(uri: String, description: Option<String>, ctx: CliContext) -> Result<()> {
+pub async fn handle_mkdir(
+    uri: String,
+    description: Option<String>,
+    acl: Option<Value>,
+    ctx: CliContext,
+) -> Result<()> {
     let client = ctx.get_client();
     commands::filesystem::mkdir(
         &client,
         &uri,
         description.as_deref(),
+        acl,
         ctx.output_format,
         ctx.compact,
     )
@@ -1825,8 +1938,20 @@ pub async fn handle_acl(action: crate::AclCommands, ctx: CliContext) -> Result<(
         crate::AclCommands::Get { uri } => {
             commands::acl::get(&client, &uri, ctx.output_format, ctx.compact).await
         }
-        crate::AclCommands::Set { uri, entries } => {
-            commands::acl::set(&client, &uri, entries, ctx.output_format, ctx.compact).await
+        crate::AclCommands::Set {
+            uri,
+            entries,
+            acl_mode,
+        } => {
+            commands::acl::set(
+                &client,
+                &uri,
+                entries,
+                acl_mode,
+                ctx.output_format,
+                ctx.compact,
+            )
+            .await
         }
         crate::AclCommands::Grant {
             uri,
@@ -1857,6 +1982,8 @@ pub async fn handle_grep(
     exclude_uri: Option<String>,
     pattern: String,
     ignore_case: bool,
+    after_context: i32,
+    before_context: i32,
     node_limit: i32,
     level_limit: i32,
     tags: Vec<String>,
@@ -1881,6 +2008,12 @@ pub async fn handle_grep(
     if ignore_case {
         params.push("-i".to_string());
     }
+    if after_context > 0 {
+        params.push(format!("-a {}", after_context));
+    }
+    if before_context > 0 {
+        params.push(format!("-b {}", before_context));
+    }
     if !tags.is_empty() {
         params.push(format!("--tags {}", tags.join(",")));
     }
@@ -1896,6 +2029,8 @@ pub async fn handle_grep(
         exclude_uri,
         &pattern,
         ignore_case,
+        after_context,
+        before_context,
         node_limit,
         level_limit,
         &tags,

@@ -1,6 +1,6 @@
 # DeepSeek Harness Memory Bundle
 
-Give [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (`dsh`) cross-project and cross-session long-term memory. Once installed, every conversation automatically recalls relevant memories and captures new content, and the model gets the OpenViking tools and the `openviking-memory` skill without any extra setup.
+Give [DeepSeek Harness](https://www.npmjs.com/package/@deepseek-ai/dsh) (`dsh`) cross-project and cross-session long-term memory. Once installed, every conversation automatically recalls relevant memories and captures new content, and the model gets the OpenViking tools and the `openviking-memory` and `openviking-skills` skills without any extra setup.
 
 Source: [examples/dsh-memory-plugin](https://github.com/volcengine/OpenViking/tree/main/examples/dsh-memory-plugin)
 
@@ -41,7 +41,7 @@ After using it for a while, start a new conversation and ask about something you
    dsh --profile web --dump-config
    ```
 
-   The output should contain an `openviking-memory` plugin group.
+   The output should contain an `openviking-memory-runtime` entry.
 
 > Don't have `ovcli.conf` yet? See the [Deployment Guide → CLI](../guides/03-deployment.md#cli).
 >
@@ -53,17 +53,17 @@ After using it for a while, start a new conversation and ask about something you
 
 Start `dsh --profile web` and open a conversation. You should see an OpenViking context injection at the top of the session, and the model should have `mcp__openviking__*` tools available. Ask it about something from an earlier session to confirm recall.
 
-If nothing appears, set `OV_DEBUG_LOG=/tmp/ov-dsh.log` and check that file.
+For MCP proxy diagnostics, set `OPENVIKING_DEBUG=1` and `OPENVIKING_DEBUG_LOG=/tmp/ov-dsh.log` before starting DSH, then check that file. Automatic memory callbacks use DSH's own logger. The legacy `OV_DEBUG_LOG=/tmp/ov-dsh.log` alias is still supported and takes precedence over both canonical settings.
 
 ## How it works
 
-The bundle runs inside DSH as a Cordis plugin rather than as external hooks, so it follows the session in-process. At session start it injects your OpenViking profile block and an index of available memories. Before every model step it searches OpenViking with the current input and appends what it finds to that step as a durable message, so the injection replays with the session and is visible to compaction. It captures user, assistant, and (optionally) tool-result messages straight from DSH's event stream, and commits to OpenViking once pending tokens cross the threshold, keeping the ten most recent messages live. Writes that fail land in a pending queue and replay at the next session start.
+The bundle runs inside DSH as a Cordis plugin rather than as external hooks, so it follows the session in-process. At session start it injects your OpenViking profile block, an index of available memories, and an `<available-skills>` catalog of your OpenViking skills. Before every model step it searches OpenViking with the current input and appends what it finds to that step as a durable message, so the injection replays with the session and is visible to compaction. It captures user, assistant, and (optionally) tool-result messages straight from DSH's event stream, and commits to OpenViking once pending tokens cross the threshold, keeping the ten most recent messages live. Writes that fail land in a pending queue and replay at the next session start.
 
 Each DSH session maps to `dsh-<session-id>` in OpenViking, and every subagent gets its own session.
 
-The model-facing surface is the OpenViking MCP tool set, reached through the same stdio proxy the other memory integrations use and published under an `mcp__openviking__` prefix. Because that proxy runs once per profile, `mcp__openviking__remember` stores into a short-lived server-side session rather than the current one—automatic capture still records the conversation itself—and tool calls carry the actor peer resolved at startup. Set `OPENVIKING_PEER_ID` when one process serves several workspaces and tool calls need exact attribution. The bundle also ships the shared `openviking-memory` skill, so the model knows when to search, read, and write.
+The model-facing surface is the OpenViking MCP tool set, reached through the same stdio proxy the other memory integrations use and published under an `mcp__openviking__` prefix. Because that proxy runs once per profile, `mcp__openviking__remember` stores into a short-lived server-side session rather than the current one—automatic capture still records the conversation itself—and tool calls carry the actor peer resolved at startup. Set `OPENVIKING_PEER_ID` when one process serves several workspaces and tool calls need exact attribution. The bundle also ships two shared skills: `openviking-memory`, so the model knows when to search, read, and write, and `openviking-skills`, which covers finding, using, creating, sharing, and migrating skills stored in OpenViking.
 
-Accidental filesystem or shell calls on `viking://` URIs are blocked with a hint pointing at the right OpenViking tool.
+A filesystem tool call whose path is a `viking://` URI is blocked with a hint pointing at the right OpenViking tool. For a write or edit under a skill directory such as `viking://~/skills/<name>/`, that tool is `mcp__openviking__add_skill`, which creates or replaces a whole skill from its `SKILL.md` text. A shell command that carries a `viking://` URI still runs, and the model gets a notice suggesting the OpenViking tools, which it can ignore when the URI is intentional data.
 
 <details>
 <summary><b>Configuration</b></summary>
@@ -78,32 +78,28 @@ Credentials resolve from `OPENVIKING_*` environment variables, then `~/.openviki
 | `OPENVIKING_PEER_ID` | — | Explicit actor peer |
 | `OPENVIKING_WORKSPACE_PEER` | `true` | Derive a peer from each session's workspace; `0` sends no peer |
 | `OPENVIKING_RECALL_PEER_SCOPE` | `all` | `actor` isolates recall to the current workspace |
-| `OV_DEBUG_LOG` | — | Write debug logs to this path |
+| `OPENVIKING_DEBUG` | `false` | Enable MCP proxy debug logging; also requires a log path |
+| `OPENVIKING_DEBUG_LOG` | `""` | File path for MCP proxy debug logs |
+| `OV_DEBUG_LOG` | — | Legacy alias: enables MCP proxy logging and overrides the canonical debug flag and log path |
 
 Behavior knobs live in the profile's Cordis patch entry:
 
 ```yaml
-- insert:
-    - id: openviking-memory
-      name: '@deepseek-ai/cordis-plugin-group'
-      group: true
-      isolate:
-        openvikingMemory: true
-      config:
-        - id: openviking-memory-runtime
-          name: '@openviking/dsh-memory-plugin'
-          config:
-            recallTokenBudget: 2000
-            scoreThreshold: 0.35
-            captureToolResults: false
-            commitTokenThreshold: 20000
+- id: openviking-memory-runtime
+  config:
+    recallTokenBudget: 2000
+    scoreThreshold: 0.35
+    captureToolResults: false
+    commitTokenThreshold: 20000
 ```
 
 `syncTurns: false`, in that same block, makes the integration read-only: it still injects your profile and recalls memories, but sends nothing back — no captured turns, no commits, and no replay of writes an earlier session queued, which stay on the queue until a session that still writes drains them.
 
 `peerSource`, in that same `config` block, decides how the workspace peer is derived. The default `"git"` uses the repository's normalized `origin` URL (`git@github.com:volcengine/OpenViking.git` becomes `github.com-volcengine-openviking`), falling back to the repository root path, so every clone, worktree, and subdirectory of one repository shares a single peer; outside a repository no peer is sent at all, and what is remembered there goes to your user-level space at `viking://user/<you>/memories`. `"cwd"` restores the earlier behavior — the working directory with every non-alphanumeric character replaced by `-` — and `"none"` sends no peer at all. To give a directory outside a repository its own memory, set `OPENVIKING_PEER_ID` for it ([Give a Directory Its Own Peer](../configuration/02-client.md#give-a-directory-its-own-peer)).
 
-Credentials given in the patch win over the environment; behavior toggles read the environment first. The full list is documented in the [bundle README](https://github.com/volcengine/OpenViking/tree/main/examples/dsh-memory-plugin).
+`skillCatalog` and `skillCatalogTokenBudget`, in that same block, control the skill catalog injected at session start. It lists your own skills before those shared with your account under `viking://agent/skills`, each description cut to about 40 tokens, within its own budget (default `1200` tokens, separate from the profile budget); when not every description fits, it lists names only. `skillCatalog: false` or a budget of `0` turns it off; the environment spellings are `OPENVIKING_SKILL_CATALOG` and `OPENVIKING_SKILL_CATALOG_TOKEN_BUDGET`.
+
+Credentials given in the patch win over the environment. Behavior knobs resolve highest priority first: `OPENVIKING_*` environment variables, the workspace's `.openviking/config.json` and `config.local.json`, `ovcli.conf`'s `plugin.dsh`, `ovcli.conf`'s `plugin`, then this patch block. The full list is documented in the [bundle README](https://github.com/volcengine/OpenViking/tree/main/examples/dsh-memory-plugin).
 
 </details>
 
@@ -111,7 +107,7 @@ Credentials given in the patch win over the environment; behavior toggles read t
 
 | Issue | What to check |
 |-------|---------------|
-| Nothing injected, no OpenViking tools | `dsh --profile web --dump-config` should list `openviking-memory`; re-run the installer or `dsh plugin --profile web add …` |
+| Nothing injected, no OpenViking tools | `dsh --profile web --dump-config` should list `openviking-memory-runtime`; re-run the installer or `dsh plugin --profile web add …` |
 | Installed into the wrong profile | The installer defaults to `web`; re-run it with `--dsh-profile <name>` |
 | `ERESOLVE` during install | The `@deepseek-ai/dsh-*` prerelease tags drift apart; install `@deepseek-ai/dsh@0.1.0-rc.6` exactly |
 | Install says the package is "not in the npm registry" | pnpm refuses releases younger than 24 hours by default (`minimumReleaseAge`). Wait it out, or add the exact version to `minimumReleaseAgeExclude` in the profile's `pnpm-workspace.yaml` |

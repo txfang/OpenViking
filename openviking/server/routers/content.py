@@ -27,9 +27,10 @@ from openviking.server.error_mapping import map_exception
 from openviking.server.identity import RequestContext, Role
 from openviking.server.models import Response
 from openviking.server.telemetry import run_operation
+from openviking.storage.acl import AclSpec
 from openviking.storage.vector_ids import is_vector_record_id
 from openviking.telemetry import TelemetryRequest
-from openviking_cli.exceptions import InvalidArgumentError, NotFoundError, PermissionDeniedError
+from openviking_cli.exceptions import NotFoundError, PermissionDeniedError
 from openviking_cli.utils import get_logger
 
 logger = get_logger(__name__)
@@ -48,7 +49,8 @@ class WriteContentRequest(BaseModel):
     telemetry: TelemetryRequest = False
     processing_mode: ProcessingMode = DEFAULT_PROCESSING_MODE
     tags: list[str] | None = None
-    tag_mode: Literal["replace", "append"] = "replace"
+    tag_mode: Literal["replace", "append", "clear"] = "replace"
+    acl: AclSpec | None = None
 
 
 class BatchWriteOperation(BaseModel):
@@ -82,19 +84,17 @@ class SetTagsRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     uri: str
-    tags: list[str]
+    tags: list[str] | None = None
     mode: str = "replace"
     recursive: bool = False
     telemetry: TelemetryRequest = False
 
 
 class ReindexRequest(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-
     uri: str
     mode: str = "vectors_only"
+    force: bool = False
     wait: bool = True
-    dry_run: bool = False
     recursive: bool = True
     tags: list[str] | None = None
     tag_mode: str = "replace"
@@ -249,6 +249,7 @@ async def write(
             processing_mode=request.processing_mode,
             tags=request.tags,
             tag_mode=request.tag_mode,
+            acl=request.acl,
         ),
     )
     return Response(
@@ -297,12 +298,13 @@ async def set_tags(
     """Set explicit k=v retrieval tags metadata for a file or directory."""
     service = get_service()
     uri = validate_request_viking_uri(resolve_path_variables(request.uri), _ctx)
+    tags = [] if request.mode == "clear" else request.tags or []
     execution = await run_operation(
         operation="content.set_tags",
         telemetry=request.telemetry,
         fn=lambda: service.fs.set_tags(
             uri=uri,
-            tags=request.tags,
+            tags=tags,
             mode=request.mode,
             recursive=request.recursive,
             ctx=_ctx,
@@ -321,8 +323,6 @@ async def reindex(
     ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN, Role.USER),
 ):
     """Reindex semantic/vector artifacts for a URI-scoped maintenance target."""
-    if body.dry_run and body.mode != "prune_orphans":
-        raise InvalidArgumentError("dry_run is only supported for prune_orphans reindex mode.")
     uri = validate_request_viking_uri(resolve_path_variables(body.uri), ctx)
     uri = _authorize_reindex_uri(uri, ctx)
     service = get_service()
@@ -330,12 +330,13 @@ async def reindex(
         "uri": uri,
         "mode": body.mode,
         "wait": body.wait,
-        "dry_run": body.dry_run,
         "ctx": ctx,
     }
+    if body.force:
+        reindex_kwargs["force"] = True
     if not body.recursive:
         reindex_kwargs["recursive"] = False
-    if body.tags is not None:
+    if body.tags is not None or body.tag_mode == "clear":
         reindex_kwargs["tags"] = body.tags
         reindex_kwargs["tag_mode"] = body.tag_mode
     result = await service.reindex(

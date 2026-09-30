@@ -42,7 +42,10 @@ use ragfs::cache::{
     CacheDecision, CacheNamespace, CachePolicy, CacheTraversalMode, CachedFileSystem,
 };
 use ragfs::cache_runtime::{CacheRuntime, MemoryMockProvider};
-use ragfs::core::{FsContextInner, GrepResult, MultiWriteWrappedFS, TreeEntry, FS_CTX};
+use ragfs::core::{
+    FsContextInner, GrepOptions, GrepResult, ListSortBy, MultiWriteWrappedFS, SortOrder, TreeEntry,
+    FS_CTX,
+};
 use ragfs::plugins::MemFileSystem;
 use ragfs::{Error, FileInfo, FileSystem, Result, WriteFlag};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,9 +145,18 @@ impl FileSystem for CountingFileSystem {
         self.inner.write(path, data, offset, flags).await
     }
 
-    async fn read_dir(&self, path: &str) -> Result<Vec<FileInfo>> {
+    async fn read_dir(
+        &self,
+        path: &str,
+        offset: Option<usize>,
+        limit: Option<usize>,
+        sort_by: Option<ListSortBy>,
+        sort_order: Option<SortOrder>,
+    ) -> Result<Vec<FileInfo>> {
         self.read_dirs.fetch_add(1, Ordering::Relaxed);
-        self.inner.read_dir(path).await
+        self.inner
+            .read_dir(path, offset, limit, sort_by, sort_order)
+            .await
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo> {
@@ -168,24 +180,10 @@ impl FileSystem for CountingFileSystem {
         &self,
         path: &str,
         pattern: &str,
-        recursive: bool,
-        case_insensitive: bool,
-        node_limit: Option<usize>,
-        exclude_path: Option<&str>,
-        level_limit: Option<usize>,
+        options: GrepOptions<'_>,
     ) -> Result<GrepResult> {
         self.greps.fetch_add(1, Ordering::Relaxed);
-        self.inner
-            .grep(
-                path,
-                pattern,
-                recursive,
-                case_insensitive,
-                node_limit,
-                exclude_path,
-                level_limit,
-            )
-            .await
+        self.inner.grep(path, pattern, options).await
     }
 
     async fn tree_directory(
@@ -194,10 +192,23 @@ impl FileSystem for CountingFileSystem {
         show_hidden: bool,
         node_limit: Option<usize>,
         level_limit: Option<usize>,
+        offset: Option<usize>,
+        sort_by: Option<ListSortBy>,
+        sort_order: Option<SortOrder>,
+        directories_only: bool,
     ) -> Result<Vec<TreeEntry>> {
         self.trees.fetch_add(1, Ordering::Relaxed);
         self.inner
-            .tree_directory(path, show_hidden, node_limit, level_limit)
+            .tree_directory(
+                path,
+                show_hidden,
+                node_limit,
+                level_limit,
+                offset,
+                sort_by,
+                sort_order,
+                directories_only,
+            )
             .await
     }
 }
@@ -302,7 +313,10 @@ async fn default_tree_directory_delegates_to_backend() {
     let probe = backend.clone();
     let (fs, _) = cached_fs(backend);
 
-    let entries = fs.tree_directory("/docs", false, None, None).await.unwrap();
+    let entries = fs
+        .tree_directory("/docs", false, None, None, None, None, None, false)
+        .await
+        .unwrap();
 
     assert_eq!(entries.len(), 1);
     assert_eq!(probe.tree_count(), 1);
@@ -321,7 +335,14 @@ async fn default_grep_delegates_to_backend() {
     let (fs, _) = cached_fs(backend);
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -350,12 +371,18 @@ async fn cached_tree_traversal_reuses_directory_cache_after_warmup() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    let first = fs.tree_directory("/docs", false, None, None).await.unwrap();
+    let first = fs
+        .tree_directory("/docs", false, None, None, None, None, None, false)
+        .await
+        .unwrap();
     assert_eq!(first.len(), 3);
     assert_eq!(probe.tree_count(), 0);
     assert_eq!(probe.read_dir_count(), 2);
 
-    let second = fs.tree_directory("/docs", false, None, None).await.unwrap();
+    let second = fs
+        .tree_directory("/docs", false, None, None, None, None, None, false)
+        .await
+        .unwrap();
     assert_eq!(second.len(), 3);
     assert_eq!(
         probe.read_dir_count(),
@@ -384,7 +411,14 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     );
 
     let first = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(first.count, 2);
@@ -394,7 +428,14 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
     assert_eq!(probe.stat_count(), 1);
 
     let second = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
     assert_eq!(second.count, 2);
@@ -416,6 +457,47 @@ async fn cached_grep_traversal_reuses_directory_and_file_cache_after_warmup() {
 }
 
 #[tokio::test]
+async fn cached_grep_includes_context_from_cached_content() {
+    let backend = CountingFileSystem::new();
+    backend.mkdir("/docs", 0o755).await.unwrap();
+    backend
+        .write(
+            "/docs/a.md",
+            b"first\nbefore\nneedle\nafter",
+            0,
+            WriteFlag::Create,
+        )
+        .await
+        .unwrap();
+    let (fs, _) = cached_fs_with_policy(
+        backend,
+        CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
+    );
+
+    let result = fs
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                before_context: 2,
+                after_context: 1,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+    let matched = &result.matches[0];
+    assert_eq!(matched.before_context.as_ref().unwrap()[0].content, "first");
+    assert_eq!(
+        matched.before_context.as_ref().unwrap()[1].content,
+        "before"
+    );
+    assert_eq!(matched.after_context.as_ref().unwrap()[0].content, "after");
+}
+
+#[tokio::test]
 async fn cached_grep_batches_generation_validation_after_warmup() {
     let backend = CountingFileSystem::new();
     backend.mkdir("/docs", 0o755).await.unwrap();
@@ -433,13 +515,27 @@ async fn cached_grep_batches_generation_validation_after_warmup() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -468,13 +564,27 @@ async fn cached_grep_memoizes_generation_keys_within_one_traversal() {
         CachePolicy::default().with_traversal_mode(CacheTraversalMode::CachedTraversal),
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -516,13 +626,27 @@ async fn cached_grep_scans_cached_files_with_bounded_concurrency() {
         provider,
     );
 
-    fs.grep("/docs", "needle", true, false, None, None, None)
-        .await
-        .unwrap();
+    fs.grep(
+        "/docs",
+        "needle",
+        GrepOptions {
+            recursive: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
     provider.reset_observed_reads();
 
     let result = fs
-        .grep("/docs", "needle", true, false, None, None, None)
+        .grep(
+            "/docs",
+            "needle",
+            GrepOptions {
+                recursive: true,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
@@ -566,11 +690,14 @@ async fn cached_grep_traversal_matches_default_grep_semantics() {
         .grep(
             "/docs",
             "needle",
-            true,
-            true,
-            Some(2),
-            Some("/docs/skip"),
-            Some(1),
+            GrepOptions {
+                recursive: true,
+                case_insensitive: true,
+                node_limit: Some(2),
+                exclude_path: Some("/docs/skip"),
+                level_limit: Some(1),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -578,11 +705,14 @@ async fn cached_grep_traversal_matches_default_grep_semantics() {
         .grep(
             "/docs",
             "needle",
-            true,
-            true,
-            Some(2),
-            Some("/docs/skip"),
-            Some(1),
+            GrepOptions {
+                recursive: true,
+                case_insensitive: true,
+                node_limit: Some(2),
+                exclude_path: Some("/docs/skip"),
+                level_limit: Some(1),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -619,9 +749,16 @@ async fn cached_grep_traversal_falls_back_for_multiwrite_backend() {
     let ctx = Arc::new(FsContextInner::new("acct"));
     let result = FS_CTX
         .scope(ctx, async {
-            fs.grep("/docs", "needle", true, false, None, None, None)
-                .await
-                .unwrap()
+            fs.grep(
+                "/docs",
+                "needle",
+                GrepOptions {
+                    recursive: true,
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap()
         })
         .await;
 
@@ -662,11 +799,11 @@ async fn cached_tree_traversal_matches_default_tree_semantics() {
     );
 
     let cached = fs
-        .tree_directory("/docs", false, None, Some(1))
+        .tree_directory("/docs", false, None, Some(1), None, None, None, false)
         .await
         .unwrap();
     let direct_entries = direct
-        .tree_directory("/docs", false, None, Some(1))
+        .tree_directory("/docs", false, None, Some(1), None, None, None, false)
         .await
         .unwrap();
     assert_eq!(
@@ -680,7 +817,10 @@ async fn cached_tree_traversal_matches_default_tree_semantics() {
             .collect::<Vec<_>>()
     );
 
-    let with_hidden = fs.tree_directory("/docs", true, None, None).await.unwrap();
+    let with_hidden = fs
+        .tree_directory("/docs", true, None, None, None, None, None, false)
+        .await
+        .unwrap();
     assert!(
         with_hidden
             .iter()
@@ -711,14 +851,14 @@ async fn cached_tree_traversal_returns_oversized_directories_without_caching_the
     );
 
     assert_eq!(
-        fs.tree_directory("/large", false, None, None)
+        fs.tree_directory("/large", false, None, None, None, None, None, false)
             .await
             .unwrap()
             .len(),
         4097
     );
     assert_eq!(
-        fs.tree_directory("/large", false, None, None)
+        fs.tree_directory("/large", false, None, None, None, None, None, false)
             .await
             .unwrap()
             .len(),
@@ -750,14 +890,14 @@ async fn cached_tree_traversal_falls_back_when_provider_is_unavailable() {
     );
 
     assert_eq!(
-        fs.tree_directory("/docs", false, None, None)
+        fs.tree_directory("/docs", false, None, None, None, None, None, false)
             .await
             .unwrap()
             .len(),
         1
     );
     assert_eq!(
-        fs.tree_directory("/docs", false, None, None)
+        fs.tree_directory("/docs", false, None, None, None, None, None, false)
             .await
             .unwrap()
             .len(),
@@ -789,7 +929,9 @@ async fn cached_tree_traversal_falls_back_for_multiwrite_backend() {
     let ctx = Arc::new(FsContextInner::new("acct"));
     let entries = FS_CTX
         .scope(ctx, async {
-            fs.tree_directory("/docs", false, None, None).await.unwrap()
+            fs.tree_directory("/docs", false, None, None, None, None, None, false)
+                .await
+                .unwrap()
         })
         .await;
 
@@ -868,14 +1010,26 @@ async fn read_dir_is_cached_and_parent_changes_invalidate_it() {
     let probe = backend.clone();
     let (fs, _) = cached_fs(backend);
 
-    assert_eq!(fs.read_dir("/docs").await.unwrap().len(), 1);
-    assert_eq!(fs.read_dir("/docs").await.unwrap().len(), 1);
+    assert_eq!(
+        fs.read_dir("/docs", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        fs.read_dir("/docs", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(probe.read_dir_count(), 1);
 
     fs.write("/docs/two.md", b"two", 0, WriteFlag::Create)
         .await
         .unwrap();
-    let entries = fs.read_dir("/docs").await.unwrap();
+    let entries = fs.read_dir("/docs", None, None, None, None).await.unwrap();
     assert_eq!(entries.len(), 2);
     assert_eq!(probe.read_dir_count(), 2);
 
@@ -903,8 +1057,22 @@ async fn oversized_directories_bypass_directory_cache() {
     let cacheable_probe = cacheable.clone();
     let (cacheable_fs, _) = cached_fs(cacheable);
 
-    assert_eq!(cacheable_fs.read_dir("/small").await.unwrap().len(), 4096);
-    assert_eq!(cacheable_fs.read_dir("/small").await.unwrap().len(), 4096);
+    assert_eq!(
+        cacheable_fs
+            .read_dir("/small", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        4096
+    );
+    assert_eq!(
+        cacheable_fs
+            .read_dir("/small", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        4096
+    );
     assert_eq!(cacheable_probe.read_dir_count(), 1);
 
     let oversized = CountingFileSystem::new();
@@ -923,8 +1091,22 @@ async fn oversized_directories_bypass_directory_cache() {
     let oversized_probe = oversized.clone();
     let (oversized_fs, _) = cached_fs(oversized);
 
-    assert_eq!(oversized_fs.read_dir("/large").await.unwrap().len(), 4097);
-    assert_eq!(oversized_fs.read_dir("/large").await.unwrap().len(), 4097);
+    assert_eq!(
+        oversized_fs
+            .read_dir("/large", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        4097
+    );
+    assert_eq!(
+        oversized_fs
+            .read_dir("/large", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        4097
+    );
     assert_eq!(oversized_probe.read_dir_count(), 2);
 }
 
@@ -940,15 +1122,33 @@ async fn all_directory_membership_mutations_invalidate_parent_entries() {
     let probe = backend.clone();
     let (fs, _) = cached_fs(backend);
 
-    assert_eq!(fs.read_dir("/root").await.unwrap().len(), 2);
-    assert_eq!(fs.read_dir("/root").await.unwrap().len(), 2);
+    assert_eq!(
+        fs.read_dir("/root", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
+    assert_eq!(
+        fs.read_dir("/root", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     fs.mkdir("/root/new", 0o755).await.unwrap();
-    assert_eq!(fs.read_dir("/root").await.unwrap().len(), 3);
+    assert_eq!(
+        fs.read_dir("/root", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        3
+    );
 
     fs.rename("/root/old", "/root/moved").await.unwrap();
     let names: Vec<String> = fs
-        .read_dir("/root")
+        .read_dir("/root", None, None, None, None)
         .await
         .unwrap()
         .into_iter()
@@ -958,10 +1158,22 @@ async fn all_directory_membership_mutations_invalidate_parent_entries() {
     assert!(!names.contains(&"old".to_string()));
 
     fs.remove("/root/file.txt").await.unwrap();
-    assert_eq!(fs.read_dir("/root").await.unwrap().len(), 2);
+    assert_eq!(
+        fs.read_dir("/root", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     fs.remove_all("/root/new").await.unwrap();
-    assert_eq!(fs.read_dir("/root").await.unwrap().len(), 1);
+    assert_eq!(
+        fs.read_dir("/root", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
     assert_eq!(probe.read_dir_count(), 5);
 }
 
@@ -1097,7 +1309,13 @@ async fn remove_all_error_invalidates_cached_state_after_partial_mutation() {
         b"survivor"
     );
     assert_eq!(fs.read("/unrelated.txt", 0, 0).await.unwrap(), b"unrelated");
-    assert_eq!(fs.read_dir("/tree").await.unwrap().len(), 2);
+    assert_eq!(
+        fs.read_dir("/tree", None, None, None, None)
+            .await
+            .unwrap()
+            .len(),
+        2
+    );
 
     let error = fs.remove_all("/tree").await.unwrap_err();
     assert!(error.to_string().contains("partially removed"));
@@ -1108,7 +1326,7 @@ async fn remove_all_error_invalidates_cached_state_after_partial_mutation() {
         b"survivor"
     );
     assert_eq!(fs.read("/unrelated.txt", 0, 0).await.unwrap(), b"unrelated");
-    let entries = fs.read_dir("/tree").await.unwrap();
+    let entries = fs.read_dir("/tree", None, None, None, None).await.unwrap();
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].name, "survivor.txt");
     assert_eq!(probe.read_count(), 5);

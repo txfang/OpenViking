@@ -130,6 +130,7 @@ pub async fn find(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -147,6 +148,7 @@ pub async fn find(
             context_type,
             tags,
             read_content,
+            events_time_decay_protection,
         )
         .await?;
     output_search_results(
@@ -173,6 +175,7 @@ pub async fn search(
     context_type: Option<Vec<String>>,
     tags: Option<Vec<String>>,
     read_content: bool,
+    events_time_decay_protection: Option<String>,
     output_format: OutputFormat,
     compact: bool,
 ) -> Result<()> {
@@ -191,6 +194,7 @@ pub async fn search(
             context_type,
             tags,
             read_content,
+            events_time_decay_protection,
         )
         .await?;
     output_search_results(
@@ -279,6 +283,7 @@ fn render_search_results_for_table_with_context(
             text_width,
             hide_level_and_score,
             split_name_description,
+            context.is_some_and(|context| context.mode == SearchRenderMode::SkillsFind),
             &mut lines,
         );
     }
@@ -409,6 +414,7 @@ fn render_search_result_card(
     text_width: usize,
     hide_level_and_score: bool,
     split_name_and_description: bool,
+    prefer_root_uri: bool,
     lines: &mut Vec<String>,
 ) {
     let object = item.as_object();
@@ -423,7 +429,7 @@ fn render_search_result_card(
             metadata.push(theme::value(level).bold().to_string());
         }
 
-        if let Some(score) = search_result_score(object) {
+        for score in search_result_scores(object) {
             metadata.push(theme::warning(score).bold().to_string());
         }
     }
@@ -434,7 +440,13 @@ fn render_search_result_card(
         metadata.join(" · ")
     ));
 
-    if let Some(uri) = search_result_uri(object) {
+    let root_uri = object
+        .filter(|_| prefer_root_uri)
+        .and_then(|object| object.get("root_uri"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|uri| !uri.is_empty());
+    if let Some(uri) = root_uri.or_else(|| search_result_uri(object)) {
         for line in wrap_display_text(uri, text_width, SEARCH_MAX_URI_LINES) {
             lines.push(format!("{SEARCH_INDENT}{}", theme::sky_value(line).bold()));
         }
@@ -590,13 +602,40 @@ fn normalize_level_value(level: &str) -> &str {
 }
 
 fn search_result_score(object: Option<&serde_json::Map<String, Value>>) -> Option<String> {
-    let value = object?.get("score")?;
+    parse_score(object?.get("score")?).map(|score| format!("score {score:.3}"))
+}
+
+fn search_result_scores(object: Option<&serde_json::Map<String, Value>>) -> Vec<String> {
+    let Some(object) = object else {
+        return Vec::new();
+    };
+    if !object.contains_key("origin_score") && !object.contains_key("time_score") {
+        return search_result_score(Some(object)).into_iter().collect();
+    }
+
+    [
+        ("semantic", object.get("origin_score")),
+        ("time", object.get("time_score")),
+        ("final", object.get("score")),
+    ]
+    .into_iter()
+    .map(|(label, value)| {
+        let value = value
+            .and_then(parse_score)
+            .map(|score| format!("{score:.3}"))
+            .unwrap_or_else(|| "not provided".to_string());
+        format!("{label} {value}")
+    })
+    .collect()
+}
+
+fn parse_score(value: &Value) -> Option<f64> {
     let score = value.as_f64().or_else(|| {
         value
             .as_str()
             .and_then(|value| value.trim().parse::<f64>().ok())
     })?;
-    Some(format!("score {score:.3}"))
+    Some(score)
 }
 
 fn search_result_uri(object: Option<&serde_json::Map<String, Value>>) -> Option<&str> {
@@ -635,6 +674,8 @@ pub async fn grep(
     exclude_uri: Option<String>,
     pattern: &str,
     ignore_case: bool,
+    after_context: i32,
+    before_context: i32,
     node_limit: i32,
     level_limit: i32,
     tags: &[String],
@@ -648,6 +689,8 @@ pub async fn grep(
             exclude_uri,
             pattern,
             ignore_case,
+            after_context,
+            before_context,
             node_limit,
             level_limit,
             tags,
@@ -758,7 +801,14 @@ fn render_grep_match_card(
         }
     }
 
-    if let Some(content) = object
+    let has_context = object.is_some_and(|object| {
+        object.contains_key("before_context") || object.contains_key("after_context")
+    });
+    if has_context {
+        render_grep_context_lines(object, "before_context", '-', text_width, lines);
+        render_grep_result_line(object, ':', text_width, true, lines);
+        render_grep_context_lines(object, "after_context", '-', text_width, lines);
+    } else if let Some(content) = object
         .and_then(|object| object.get("content"))
         .and_then(Value::as_str)
         .map(str::trim)
@@ -785,6 +835,48 @@ fn render_grep_match_card(
             "{SEARCH_INDENT}{}",
             theme::muted(format!("tags: {tags}"))
         ));
+    }
+}
+
+fn render_grep_context_lines(
+    object: Option<&serde_json::Map<String, Value>>,
+    key: &str,
+    separator: char,
+    text_width: usize,
+    lines: &mut Vec<String>,
+) {
+    if let Some(context) = object
+        .and_then(|object| object.get(key))
+        .and_then(Value::as_array)
+    {
+        for item in context {
+            render_grep_result_line(item.as_object(), separator, text_width, false, lines);
+        }
+    }
+}
+
+fn render_grep_result_line(
+    object: Option<&serde_json::Map<String, Value>>,
+    separator: char,
+    text_width: usize,
+    is_match: bool,
+    lines: &mut Vec<String>,
+) {
+    let Some(object) = object else {
+        return;
+    };
+    let Some(line_number) = object.get("line").and_then(Value::as_i64) else {
+        return;
+    };
+    let content = object.get("content").and_then(Value::as_str).unwrap_or("");
+    let text = format!("{line_number}{separator}{content}");
+    for line in wrap_display_text(&text, text_width, SEARCH_MAX_ABSTRACT_LINES) {
+        let styled = if is_match {
+            theme::body(line)
+        } else {
+            theme::muted(line)
+        };
+        lines.push(format!("{SEARCH_INDENT}{styled}"));
     }
 }
 
@@ -846,6 +938,8 @@ mod tests {
                 "uri": "viking://user/default/memories/entities/.overview.md",
                 "level": 1,
                 "score": 0.3805481195449829,
+                "origin_score": 0.8,
+                "time_score": 0.5,
                 "abstract": "Entity memories from user's world. Each entity has its own subdirectory including projects, people, concepts, etc."
             }
         ]);
@@ -853,7 +947,7 @@ mod tests {
         let rendered = strip_ansi(&render_search_results_for_table(&results).expect("cards"));
 
         assert!(rendered.starts_with("1 result\nRanked by relevance\n\n"));
-        assert!(rendered.contains("1. memory · Level 1 · score 0.381"));
+        assert!(rendered.contains("1. memory · Level 1 · semantic 0.800 · time 0.500 · final 0.381"));
         assert!(rendered.contains("viking://user/default/memories/entities/.overview.md"));
         assert!(rendered.contains("Entity memories from user's world."));
         assert!(!rendered.contains("peop\n   le"));
@@ -1194,6 +1288,33 @@ mod tests {
         );
 
         assert!(rendered.contains("tags: env=prod, team=search"));
+    }
+
+    #[test]
+    fn grep_table_output_distinguishes_matches_from_context() {
+        let result = json!({
+            "matches": [{
+                "line": 3,
+                "uri": "viking://resources/a.md",
+                "content": "needle",
+                "before_context": [
+                    {"line": 1, "content": "line one"},
+                    {"line": 2, "content": "line two"}
+                ],
+                "after_context": [
+                    {"line": 4, "content": "line four"}
+                ]
+            }],
+            "count": 1
+        });
+
+        let rendered =
+            strip_ansi(&render_grep_output_for_table(&result, OutputFormat::Table).expect("grep"));
+
+        assert!(rendered.contains("1-line one"));
+        assert!(rendered.contains("2-line two"));
+        assert!(rendered.contains("3:needle"));
+        assert!(rendered.contains("4-line four"));
     }
 
     #[test]
