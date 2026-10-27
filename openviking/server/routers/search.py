@@ -157,6 +157,33 @@ class FindRequest(BaseModel):
         return self
 
 
+class FindEvidenceRequest(BaseModel):
+    """Request model for Zero-Mem/EdgeMem evidence retrieval."""
+    model_config = ConfigDict(extra="forbid")
+    query: str = ""
+    target_uri: str = ""
+    top_k: int = Field(default=15, ge=1, le=50)
+    epi_window: int = Field(default=4, ge=0, le=50)
+    propagate: bool = True
+    use_semantic: bool = False
+    sem_anchor_top: int = Field(default=3, ge=1, le=20)
+    closure_radius: int = Field(default=1, ge=0, le=20)
+    strategy: Literal["legacy", "coverage"] = "legacy"
+    candidate_limit: int = Field(default=50, ge=1, le=50)
+    max_supplementary_queries: int = Field(default=2, ge=0, le=2)
+    use_memories: bool = False
+    use_events: bool = False
+    event_top_k: int = Field(default=2, ge=1, le=20)
+    telemetry: TelemetryRequest = False
+
+
+    @model_validator(mode="after")
+    def _validate_evidence_channels(self):
+        if (self.use_memories or self.use_events) and self.strategy != "coverage":
+            raise ValueError("Memory and event channels require strategy=coverage")
+        return self
+
+
 def _reject_unknown_categories(value: Any, label: str, allowed: Sequence[str]) -> None:
     if not isinstance(value, dict):
         return
@@ -416,6 +443,42 @@ async def find(
         result=result,
         telemetry=execution.telemetry,
     ).model_dump(exclude_none=True)
+
+
+@router.post("/find_evidence")
+async def find_evidence(
+    request: FindEvidenceRequest,
+    _ctx: RequestContext = Depends(get_request_context),
+):
+    """Zero-Mem/EdgeMem evidence retrieval over archived raw turns.
+    Unlike ``/find`` (which searches the memory cards directory), this endpoint
+    reads the user-space evidence index and returns raw session turns so the
+    caller can answer from the original context. Deterministic, zero LLM;
+    fail-open to an empty evidence list when the index is missing.
+    """
+    service = get_service()
+    resolved_target_uri = _resolve_uri_or_uris(request.target_uri, _ctx)
+    if isinstance(resolved_target_uri, list):
+        resolved_target_uri = resolved_target_uri[0] if resolved_target_uri else ""
+    result = await service.search.find_evidence(
+        query=request.query,
+        ctx=_ctx,
+        user_uri=resolved_target_uri,
+        top_k=request.top_k,
+        epi_window=request.epi_window,
+        propagate=request.propagate,
+        use_semantic=request.use_semantic,
+        sem_anchor_top=request.sem_anchor_top,
+        closure_radius=request.closure_radius,
+        strategy=request.strategy,
+        candidate_limit=request.candidate_limit,
+        max_supplementary_queries=request.max_supplementary_queries,
+        use_memories=request.use_memories,
+        use_events=request.use_events,
+        event_top_k=request.event_top_k,
+    )
+    result = _sanitize_floats(result)
+    return Response(status="ok", result=result).model_dump(exclude_none=True)
 
 
 def _context_ignored_fields(request: SearchRequest) -> List[str]:

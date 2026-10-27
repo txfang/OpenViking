@@ -112,6 +112,43 @@ _MEMORY_EXTRACTION_RETRY_MAX_DELAY_SECONDS = 8.0
 _AGENT_TRAINING_REQUIRED_MEMORY_TYPES = frozenset({"experiences"})
 _SESSION_PHASE1_LOCK_TIMEOUT_SECONDS = 30.0
 
+_MEMORY_STEP_NAMES = ("long_term",)
+_CUMULATIVE_CHECKPOINT_VERSION = 2
+# Match inline image transports emitted inside coding-agent tool output.
+_INLINE_IMAGE_DATA_URL_RE = re.compile(
+r"data:(image/[a-z0-9.+-]+)(?:;[^;,\s\"'\\]+)*;base64,([a-z0-9+/_=-]+)",
+ re.IGNORECASE,
+)
+_B64_JSON_RE = re.compile(
+r"(([\"'])b64_json\2\s*:\s*)([\"'])([a-z0-9+/_=-]+)\3",
+ re.IGNORECASE,
+)
+# Matches the "[Speaker]: body" text format used by locomo import messages.
+_EVIDENCE_SPEAKER_RE = re.compile(r"^\[([^\]]+)\]:\s*(.*)$", re.DOTALL)
+# Per-index-uri locks serializing load->append->save in the commit hook.
+_EVIDENCE_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
+_EVIDENCE_INDEX_LOCK_GUARD = asyncio.Lock()
+
+
+def _embed_turn_texts(
+    embedder: Any,
+    texts: List[str],
+) -> List[Optional[List[float]]]:
+    """Embed one text per turn for the ALG-A semantic channel (run in a thread).
+    Fail-open per text: a failing or missing vector yields None and that turn
+    simply joins the four-channel path.
+    """
+    out: List[Optional[List[float]]] = []
+    for text in texts:
+        try:
+            result = embedder.embed(text, is_query=False)
+            vec = getattr(result, "dense_vector", None)
+            out.append(list(vec) if vec else None)
+        except Exception as exc: # pragma: no cover - defensive
+            logger.warning("[evidence] turn embed failed: %s", exc)
+            out.append(None)
+    return out
+
 
 def _load_render_prompt() -> Callable[..., str]:
     from openviking.prompts import render_prompt
@@ -1378,6 +1415,65 @@ class Session:
             )
         )
 
+    
+    async def _append_to_evidence_index(self, messages: List[Message]) -> None:
+        """Write-time incremental append of archived turns to the evidence index.
+        Zero-Mem/EdgeMem style lexical + entity index pointing back at the
+        archived raw turns. Fail-open: any failure here degrades to a warning
+        and never affects the commit path. Encoded imports retain their
+        episode numbering; ordinary sessions append by stable message ID.
+        """
+        if not self._viking_fs or not messages:
+            return
+        try:
+            from openviking.retrieve.evidence_retriever import load_index
+        except Exception as exc: # pragma: no cover - env dependent
+            logger.debug("[evidence] module unavailable: %s", exc)
+            return
+        user_space = self._session_uri.rsplit("/sessions/", 1)[0]
+        uri = f"{user_space}/.index/evidence.json"
+        # Serialize load->append->save per index uri so two sessions committing
+        # concurrently cannot lose each other's appended chunk.
+        async with _EVIDENCE_INDEX_LOCK_GUARD:
+            lock = _EVIDENCE_INDEX_LOCKS.setdefault(uri, asyncio.Lock())
+        async with lock:
+            try:
+                index = await load_index(self._viking_fs, uri, self.ctx)
+                turns = []
+                for m in messages:
+                    text = m.content
+                    if not text:
+                        continue
+                    sm = _EVIDENCE_SPEAKER_RE.match(text)
+                    turns.append(
+                    {
+                        "id": m.id,
+                        "speaker": sm.group(1).strip() if sm else (m.peer_id or m.role or ""),
+                        "text": text,
+                        "date": m.created_at or "",
+                    }
+                    )
+                # ALG-A semantic channel: embed each turn text once at write
+                # time (bge dense vectors; zero LLM / zero token). Fail-open:
+                # no embedder or failed embed -> None entries, retrieval
+                # degrades to the four-channel path.
+                embeddings: Optional[List[Optional[List[float]]]] = None
+                if turns:
+                    try:
+                        embedder = get_openviking_config().embedding.get_embedder()
+                        if embedder is not None:
+                            embeddings = await asyncio.to_thread(
+                                _embed_turn_texts,
+                                embedder,
+                                [t["text"] for t in turns],
+                            )
+                    except Exception as exc: # pragma: no cover - fail-open
+                        logger.warning("[evidence] embedder unavailable: %s", exc)
+                if index.append_chunk(self.session_id, turns, user_space, embeddings):
+                    await index.save(self._viking_fs, uri, self.ctx)
+            except Exception as exc: # pragma: no cover - fail-open
+                logger.warning("[evidence] index append failed: %s", exc)
+
     @tracer("session.commit.phase1")
     async def commit_async(
         self,
@@ -1714,6 +1810,9 @@ class Session:
                             )
                         },
                     )
+                # Zero-Mem evidence index: write-time incremental append of the
+                # archived raw turns (fail-open; never blocks the commit).
+                await self._append_to_evidence_index(messages_to_archive)
 
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages

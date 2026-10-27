@@ -13,6 +13,7 @@ submitted to the process-global StreamingPolicyTrainer.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timezone
@@ -37,6 +38,9 @@ from openviking.session.memory.dataclass import (
     ResolvedOperation,
     ResolvedOperations,
     StoredLink,
+)
+from openviking.session.memory.deterministic_extractor import (
+    DeterministicMemoryExtractor,
 )
 from openviking.session.memory.memory_isolation_handler import MemoryIsolationHandler
 from openviking.session.memory.memory_type_registry import get_default_registry
@@ -125,6 +129,22 @@ def _apply_event_search_tags(
     for op in getattr(operations, "upsert_operations", []) or []:
         if getattr(op, "memory_type", None) == _EVENTS_MEMORY_TYPE:
             op.search_tags = list(tags)
+
+
+def _deterministic_extract_enabled() -> bool:
+    """Return whether deterministic (zero-LLM) memory extraction is on.
+    Config ``memory.deterministic_extract_enabled`` wins when set; otherwise the
+    ``OV_DETERMINISTIC_EXTRACT`` env var is consulted and defaults to enabled.
+    Set to "0" (or false) to fall back to the original ReAct ExtractLoop without
+    touching any other code.
+    """
+    try:
+        val = getattr(get_openviking_config().memory, "deterministic_extract_enabled", None)
+    except Exception:
+        val = None
+    if val is not None:
+        return bool(val)
+    return os.environ.get("OV_DETERMINISTIC_EXTRACT", "1") != "0"
 
 
 def _initialize_extraction_telemetry() -> None:
@@ -733,16 +753,25 @@ class SessionCompressorV3:
         isolation_handler.prepare_messages()
         context_provider._isolation_handler = isolation_handler
 
-        orchestrator = self._get_or_create_react(
-            ctx=ctx,
-            messages=messages,
-            latest_archive_overview=latest_archive_overview,
-            isolation_handler=isolation_handler,
-            transaction_handle=None,
-            context_provider=context_provider,
-            vlm_config=vlm_config,
-        )
-        operations, _tools_used = await orchestrator.run()
+        if _deterministic_extract_enabled():
+            operations = await self._run_deterministic_extraction(
+                messages=messages,
+                ctx=ctx,
+                registry=registry,
+                allowed_memory_types=allowed_memory_types,
+                extract_context=extract_context,
+            )
+        else:
+            orchestrator = self._get_or_create_react(
+                ctx=ctx,
+                messages=messages,
+                latest_archive_overview=latest_archive_overview,
+                isolation_handler=isolation_handler,
+                transaction_handle=None,
+                context_provider=context_provider,
+                vlm_config=vlm_config,
+            )
+            operations, _tools_used = await orchestrator.run()
         if operations is None:
             tracer.info("[v3_patch_merge] No memory operations generated")
             return _V3ExtractionResult()
@@ -816,6 +845,36 @@ class SessionCompressorV3:
                 getattr(result, "skipped_operations", [])
             ),
         )
+
+    async def _run_deterministic_extraction(
+        self,
+        *,
+        messages: List[Message],
+        ctx: RequestContext,
+        registry: Any,
+        allowed_memory_types: Optional[set[str]],
+        extract_context: ExtractContext,
+    ) -> Optional[ResolvedOperations]:
+        """Zero-LLM memory extraction via DeterministicMemoryExtractor.
+        The extractor runs on ``extract_context.messages`` so event ``ranges``
+        indices stay aligned with the events content template rendering at apply
+        time. Downstream submit/merge/vectorize chain is shared with the LLM
+        path unchanged.
+        """
+        extractor = DeterministicMemoryExtractor(
+            registry=registry,
+            viking_fs=get_viking_fs(),
+        )
+        try:
+            return await extractor.extract(
+                messages=extract_context.messages if extract_context else messages,
+                ctx=ctx,
+                allowed_memory_types=allowed_memory_types,
+                extract_context=extract_context,
+            )
+        except Exception:
+            logger.exception("Deterministic memory extraction failed; skipping commit")
+            return None
 
     def _session_skill_extraction_enabled(self) -> bool:
         config = get_openviking_config()
