@@ -7,6 +7,7 @@ import asyncio
 import math
 import os
 import re
+from datetime import datetime, timezone
 from functools import lru_cache
 from collections.abc import Awaitable, Callable
 from typing import Any
@@ -195,6 +196,7 @@ async def retrieve_coverage(
     embed: Callable[[str], Awaitable[list[float] | None]],
     top_k: int = 15, candidate_limit: int = 50, max_supplementary_queries: int = 2,
     memory_sources=None, event_top_k: int = 2, event_cap: float | None = 1.,
+    use_graph: bool = False, use_time: bool = False,
 ) -> tuple[list[dict], dict[str, Any]]:
     """One initial retrieval plus at most two collection supplements.
 
@@ -249,6 +251,40 @@ async def retrieve_coverage(
     if memory_sources is not None and memory_sources.events:
         hits, protected, diagnostics["events"] = await asyncio.to_thread(
             apply_events, index, hits, memory_sources.events, question, event_top_k, event_cap)
+    if use_graph or use_time:
+        from openviking.retrieve.evidence_fusion import (
+            classify_evidence_intent, fuse_auxiliary, graph_candidates, time_candidates,
+        )
+        intent = classify_evidence_intent(question)
+        graph_hits = []
+        time_hits = []
+        content_hits = hits
+        try:
+            if use_graph and intent.channel == "graph":
+                graph_hits = await asyncio.to_thread(graph_candidates, index, question)
+            if use_time and intent.channel == "time":
+                time_hits = await asyncio.to_thread(
+                    time_candidates, index, question, now=datetime.now(timezone.utc),
+                    content_turn_ids={h["turn_id"] for h in hits})
+            hits, fusion_diag = fuse_auxiliary(hits, graph_hits, time_hits, intent,
+                                               candidate_limit=candidate_limit)
+            for hit in hits:
+                if "episode" not in hit:
+                    turns = index.get_turns([hit["turn_id"]])
+                    if turns:
+                        hit.update(turns[0])
+            diagnostics["fusion"] = dict(fusion_diag, graph_candidates=len(graph_hits),
+                                         time_candidates=len(time_hits),
+                                         candidate_ids=[h.turn_id for h in graph_hits + time_hits],
+                                         graph=index.graph_diagnostics())
+            if index.graph_unavailable and not (graph_hits or time_hits):
+                diagnostics["fusion"]["fallback_reason"] = "graph_unavailable"
+        except Exception as exc:
+            hits = content_hits
+            diagnostics["errors"].append(dict(stage="auxiliary", error_type=type(exc).__name__))
+            diagnostics["fusion"] = dict(intent=intent.name, rho=1., graph_candidates=0,
+                                         time_candidates=0, fallback_reason="auxiliary_error",
+                                         selected_channels=["content"])
     groups = build_evidence_groups(index, hits)
     # Exact-date groups reserve room first, but cannot exceed the hard budget.
     if protected:

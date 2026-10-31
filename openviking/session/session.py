@@ -1413,7 +1413,7 @@ class Session:
         )
 
     
-    async def _append_to_evidence_index(self, messages: List[Message]) -> None:
+    async def _append_to_evidence_index(self, messages: List[Message], archive_uri: str) -> None:
         """Write-time incremental append of archived turns to the evidence index.
         Zero-Mem/EdgeMem style lexical + entity index pointing back at the
         archived raw turns. Fail-open: any failure here degrades to a warning
@@ -1462,7 +1462,9 @@ class Session:
                             )
                     except Exception as exc: # pragma: no cover - fail-open
                         logger.warning("[evidence] embedder unavailable: %s", exc)
-                if index.append_chunk(self.session_id, turns, user_space, embeddings):
+                graph_enabled = get_openviking_config().memory.evidence_graph_write_enabled
+                if index.append_chunk(self.session_id, turns, user_space, embeddings,
+                                      archive_uri=archive_uri, graph_enabled=graph_enabled):
                     await index.save(self._viking_fs, uri, self.ctx, lease_ref=lease)
         except Exception as exc: # pragma: no cover - derived index is best effort
             logger.warning("[evidence] index append failed: %s", exc)
@@ -1805,7 +1807,7 @@ class Session:
                     )
                 # Zero-Mem evidence index: write-time incremental append of the
                 # archived raw turns (fail-open; never blocks the commit).
-                await self._append_to_evidence_index(messages_to_archive)
+                await self._append_to_evidence_index(messages_to_archive, archive_uri)
 
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages

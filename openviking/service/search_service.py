@@ -290,6 +290,8 @@ class SearchService:
         use_memories: bool = False,
         use_events: bool = False,
         event_top_k: int = 2,
+        use_graph: bool = False,
+        use_time: bool = False,
     ) -> Dict[str, Any]:
         """Zero-Mem/EdgeMem style evidence retrieval over archived raw turns.
         Reads the user-space evidence index (``{user_uri}/.index/evidence.json``)
@@ -299,8 +301,8 @@ class SearchService:
         A missing index yields an empty evidence list. Storage, authorization
         and parsing errors propagate rather than masquerading as an empty index.
         """
-        if (use_memories or use_events) and strategy != "coverage":
-            raise InvalidArgumentError("Memory and event channels require strategy=coverage")
+        if (use_memories or use_events or use_graph or use_time) and strategy != "coverage":
+            raise InvalidArgumentError("Auxiliary evidence channels require strategy=coverage")
         if not 1 <= event_top_k <= 20:
             raise InvalidArgumentError("event_top_k must be between 1 and 20")
         viking_fs = self._ensure_initialized()
@@ -343,6 +345,7 @@ class SearchService:
                 top_k=top_k, candidate_limit=candidate_limit,
                 max_supplementary_queries=max_supplementary_queries,
                 memory_sources=sources, event_top_k=event_top_k, event_cap=event_cap,
+                use_graph=use_graph, use_time=use_time,
             )
             return dict(query=query, index_uri=index_uri, n_evidence=len(evidence),
                         evidence=evidence,

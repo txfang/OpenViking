@@ -173,14 +173,16 @@ class FindEvidenceRequest(BaseModel):
     max_supplementary_queries: int = Field(default=2, ge=0, le=3)
     use_memories: bool = False
     use_events: bool = False
+    use_graph: bool = False
+    use_time: bool = False
     event_top_k: int = Field(default=2, ge=1, le=20)
     telemetry: TelemetryRequest = False
 
 
     @model_validator(mode="after")
     def _validate_evidence_channels(self):
-        if (self.use_memories or self.use_events) and self.strategy != "coverage":
-            raise ValueError("Memory and event channels require strategy=coverage")
+        if (self.use_memories or self.use_events or self.use_graph or self.use_time) and self.strategy != "coverage":
+            raise ValueError("Auxiliary evidence channels require strategy=coverage")
         return self
 
 
@@ -475,6 +477,8 @@ async def find_evidence(
         max_supplementary_queries=request.max_supplementary_queries,
         use_memories=request.use_memories,
         use_events=request.use_events,
+        use_graph=request.use_graph,
+        use_time=request.use_time,
         event_top_k=request.event_top_k,
     )
     result = _sanitize_floats(result)

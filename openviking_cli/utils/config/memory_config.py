@@ -100,6 +100,10 @@ class MemoryConfig(BaseModel):
             "(enabled by default; set to 0 to disable)."
         ),
     )
+    evidence_graph_write_enabled: bool = Field(
+        default=False,
+        description="Build derived evidence graph windows during session archive commits.",
+    )
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(
