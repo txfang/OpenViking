@@ -1,0 +1,18 @@
+memory_type: facts
+description: Source-backed atomic user assertions and selected assistant replies.
+directory: "viking://user/{{ user_space }}/memories/facts"
+filename_template: "{{ speaker|lower }}/{{ fact_id }}.md"
+enabled: true
+operation_mode: add_only
+embedding_template: |-
+  {{ content }}
+fields:
+  - name: speaker
+    type: string
+    merge_op: immutable
+  - name: fact_id
+    type: string
+    merge_op: immutable
+  - name: content
+    type: string
+    merge_op: immutable

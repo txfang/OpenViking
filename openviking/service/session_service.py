@@ -40,6 +40,7 @@ from openviking.utils.tags import normalize_search_tags
 from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import (
     AlreadyExistsError,
+    ConflictError,
     NotFoundError,
     NotInitializedError,
 )
@@ -402,11 +403,39 @@ class SessionService:
 
         session_uri = canonical_session_uri(ctx, session_id)
         session = self.session(ctx, session_id)
-        if not await session.exists():
-            self._record_lifecycle_metric("delete", "error")
-            raise NotFoundError(session_id, "session")
+        from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
+        from openviking.storage.acl import AclAction
 
-        await self._viking_fs.rm(session_uri, recursive=True, ctx=ctx, no_vector=True)
+        # Same lock order as commit: session, then shared user evidence index.
+        # A tree lease also excludes archive writers while deleting the session.
+        fs = self._viking_fs
+        await fs._ensure_access(session_uri, ctx, action=AclAction.MANAGE)
+        session_path = fs._uri_to_path(session_uri, ctx=ctx)
+        was_present = await session.exists()
+        # A filesystem tree lease on a missing path creates the directory for
+        # its lock token. Use an exact sidecar lease for orphan-only cleanup.
+        acquire = (fs._async_agfs.pathlock_acquire_tree if was_present
+                   else fs._async_agfs.pathlock_acquire_exact)
+        session_lease = await acquire(session_path, timeout_secs=30)
+        try:
+            exists = await session.exists()
+            if not was_present and exists:
+                raise ConflictError("Session was created concurrently; retry deletion")
+            index_uri = f"{session_uri.rsplit('/sessions/', 1)[0]}/.index/evidence.json"
+            async with evidence_index_lock(fs, index_uri, ctx) as index_lease:
+                index = await load_index(fs, index_uri, ctx)
+                if index.remove_session(session_uri):
+                    # Purge first: failure must leave the authoritative session
+                    # intact and must not report successful deletion.
+                    await index.save(fs, index_uri, ctx, lease_ref=index_lease)
+                if not exists:
+                    # Also repairs copies left by older versions on a retry.
+                    self._record_lifecycle_metric("delete", "error")
+                    raise NotFoundError(session_id, "session")
+                await fs.rm(session_uri, recursive=True, ctx=ctx, no_vector=True,
+                            lease_ref=session_lease)
+        finally:
+            await fs._async_agfs.pathlock_release(session_lease)
         if self._session_expiry_adapter is not None:
             from openviking.scheduling.expiry import SESSION_ITEM_TYPE, ItemIdentity
 

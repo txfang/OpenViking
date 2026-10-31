@@ -125,9 +125,6 @@ r"(([\"'])b64_json\2\s*:\s*)([\"'])([a-z0-9+/_=-]+)\3",
 )
 # Matches the "[Speaker]: body" text format used by locomo import messages.
 _EVIDENCE_SPEAKER_RE = re.compile(r"^\[([^\]]+)\]:\s*(.*)$", re.DOTALL)
-# Per-index-uri locks serializing load->append->save in the commit hook.
-_EVIDENCE_INDEX_LOCKS: Dict[str, asyncio.Lock] = {}
-_EVIDENCE_INDEX_LOCK_GUARD = asyncio.Lock()
 
 
 def _embed_turn_texts(
@@ -1426,18 +1423,14 @@ class Session:
         if not self._viking_fs or not messages:
             return
         try:
-            from openviking.retrieve.evidence_retriever import load_index
+            from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
         except Exception as exc: # pragma: no cover - env dependent
             logger.debug("[evidence] module unavailable: %s", exc)
             return
         user_space = self._session_uri.rsplit("/sessions/", 1)[0]
         uri = f"{user_space}/.index/evidence.json"
-        # Serialize load->append->save per index uri so two sessions committing
-        # concurrently cannot lose each other's appended chunk.
-        async with _EVIDENCE_INDEX_LOCK_GUARD:
-            lock = _EVIDENCE_INDEX_LOCKS.setdefault(uri, asyncio.Lock())
-        async with lock:
-            try:
+        try:
+            async with evidence_index_lock(self._viking_fs, uri, self.ctx) as lease:
                 index = await load_index(self._viking_fs, uri, self.ctx)
                 turns = []
                 for m in messages:
@@ -1470,9 +1463,9 @@ class Session:
                     except Exception as exc: # pragma: no cover - fail-open
                         logger.warning("[evidence] embedder unavailable: %s", exc)
                 if index.append_chunk(self.session_id, turns, user_space, embeddings):
-                    await index.save(self._viking_fs, uri, self.ctx)
-            except Exception as exc: # pragma: no cover - fail-open
-                logger.warning("[evidence] index append failed: %s", exc)
+                    await index.save(self._viking_fs, uri, self.ctx, lease_ref=lease)
+        except Exception as exc: # pragma: no cover - derived index is best effort
+            logger.warning("[evidence] index append failed: %s", exc)
 
     @tracer("session.commit.phase1")
     async def commit_async(

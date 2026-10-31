@@ -296,8 +296,8 @@ class SearchService:
         built incrementally at session commit, and returns ranked raw turns
         (episode/turn/speaker/text/date/uri) so the caller can assemble an
         answer prompt without a second read. Deterministic, zero LLM.
-        Fail-open: a missing or unparseable index yields an empty evidence list
-        and the caller falls back to the legacy ``find`` path.
+        A missing index yields an empty evidence list. Storage, authorization
+        and parsing errors propagate rather than masquerading as an empty index.
         """
         if (use_memories or use_events) and strategy != "coverage":
             raise InvalidArgumentError("Memory and event channels require strategy=coverage")
@@ -345,7 +345,9 @@ class SearchService:
                 memory_sources=sources, event_top_k=event_top_k, event_cap=event_cap,
             )
             return dict(query=query, index_uri=index_uri, n_evidence=len(evidence),
-                        evidence=evidence, diagnostics=diagnostics)
+                        evidence=evidence,
+                        facts=sources.selected_facts if sources is not None else [],
+                        diagnostics=diagnostics)
         if strategy != "legacy":
             raise InvalidArgumentError(f"Unknown evidence strategy: {strategy}")
         from openviking.retrieve.evidence_retriever import load_index

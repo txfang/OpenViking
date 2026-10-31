@@ -506,7 +506,7 @@ After exploring, analyze the conversation and output ALL memory write/edit/delet
         schemas = [
             s
             for s in self._get_registry().list_all(include_disabled=False)
-            if getattr(s, "stage", "user") == "user"
+            if getattr(s, "stage", "user") == "user" and s.memory_type != "facts"
         ]
         if self._isolation_handler:
             schemas = [s for s in schemas if self._isolation_handler.allows_schema(s)]

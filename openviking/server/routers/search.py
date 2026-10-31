@@ -170,7 +170,7 @@ class FindEvidenceRequest(BaseModel):
     closure_radius: int = Field(default=1, ge=0, le=20)
     strategy: Literal["legacy", "coverage"] = "legacy"
     candidate_limit: int = Field(default=50, ge=1, le=50)
-    max_supplementary_queries: int = Field(default=2, ge=0, le=2)
+    max_supplementary_queries: int = Field(default=2, ge=0, le=3)
     use_memories: bool = False
     use_events: bool = False
     event_top_k: int = Field(default=2, ge=1, le=20)

@@ -123,6 +123,29 @@ def select_evidence_groups(groups: list[dict], *, top_k: int) -> list[dict]:
     return list(selected.values())
 
 
+def plan_multi_target_queries(question: str) -> list[str]:
+    """Give each explicit item in a compound question its own retrieval branch."""
+    quoted = re.findall(r"['\"]([^'\"]{3,120})['\"]", question)
+    if len(quoted) >= 2:
+        return quoted[:3]
+    paired = re.search(r"\b([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\s+and\s+"
+                       r"([A-Z][a-z]+(?:\s+[A-Z][a-z]+){0,2})\b", question)
+    if paired:
+        return [paired.group(1), paired.group(2)]
+    return []
+
+
+def target_coverage_report(branches: dict[str, list[str]], selected_ids: set[str]) -> dict:
+    """Show whether each explicit subtarget has a selected source anchor."""
+    rows = []
+    for target, candidates in branches.items():
+        selected = [tid for tid in candidates if tid in selected_ids]
+        rows.append(dict(target=target, available_count=len(candidates),
+                         selected_ids=selected, covered=bool(selected)))
+    return dict(complete=all(row["covered"] for row in rows),
+                targets=rows, missing=[row for row in rows if not row["covered"]])
+
+
 def plan_collection_queries(question: str) -> list[str]:
     """Generic relation expansions; no dataset identities or answers."""
     q = question.lower()
@@ -193,11 +216,13 @@ async def retrieve_coverage(
         return candidates
 
     batches = [await retrieve(question)]
-    budget = max(0, min(max_supplementary_queries, 2))
+    budget = max(0, min(max_supplementary_queries, 3))
+    target_queries = plan_multi_target_queries(question)
+    target_candidates = {}
 
     async def supplement():
         known = {" ".join(question.lower().split())}
-        for query in plan_collection_queries(question):
+        for query in (target_queries or plan_collection_queries(question)):
             key = " ".join(query.lower().split())
             if key in known:
                 continue
@@ -206,6 +231,8 @@ async def retrieve_coverage(
             known.add(key)
             candidates = await retrieve(query)
             batches.append(candidates)
+            if query in target_queries:
+                target_candidates[query] = [hit["turn_id"] for hit in candidates]
 
     if budget:
         try:
@@ -231,4 +258,9 @@ async def retrieve_coverage(
     evidence = select_evidence_groups(groups, top_k=top_k)
     diagnostics["candidate_count"] = len(hits)
     diagnostics["selected_ids"] = [f"{t['episode']}:{t['turn']}" for t in evidence]
+    if target_queries:
+        diagnostics["target_coverage"] = target_coverage_report(
+            {target: target_candidates.get(target, []) for target in target_queries},
+            set(diagnostics["selected_ids"]),
+        )
     return evidence, diagnostics

@@ -5,18 +5,17 @@ Evidence index retriever for OpenViking.
 Zero-Mem / EdgeMem style minimal index: entity-context anchors + lexical keys
 + co-occurrence hyperedges + temporal hierarchy pointing at raw session turns.
 Design notes (see project_zero_mem_optimization memory):
-- Raw context stays byte-faithful in sessions/<sid>/history/archive_*/messages.jsonl
-  (1 line = 1 message). This index NEVER mirrors or rewrites raw text; it only
-  stores lexical/entity keys and episode structure so retrieval can point back
-  at the original turn.
+- Raw context stays in sessions/<sid>/history/archive_*/messages.jsonl.
+  This derived index also stores text and vectors; session deletion must
+  remove those copies under the same index lock used by append operations.
 - Episode merging relies on deterministic session_id encoding from the import
   script: ``sample{sid}_s{sess_num}_c{chunk_idx}``. Chunks of the same episode
   are merged by chunk index so the episode window stays contiguous even though
   the 8-message chunk boundary splits the conversation.
 - Zero LLM calls at build/retrieve time: spaCy NER + deterministic lexical
   features only. The final answer reader is the only LLM step.
-- Fail-open: any failure degrades to returning an empty evidence list; the
-  caller falls back to the legacy ``find`` path.
+- Only a missing file is an empty index. Read, parse and write failures must
+  propagate so a transient failure cannot replace persisted history.
 Version 2 adds an optional semantic channel (E-plan): turn texts are embedded
 once at write time (``emb`` field, 384-d bge dense vectors, zero LLM / zero
 token) and ``retrieve(use_semantic=True)`` runs the ALG-A algorithm — lexical
@@ -35,6 +34,7 @@ import math
 import os
 import re
 from collections import defaultdict
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
 logger = logging.getLogger(__name__)
@@ -394,27 +394,59 @@ class EvidenceIndex:
                 index._index_turn(turn)
                 index._n_turns += 1
         return index
-    async def save(self, viking_fs: Any, uri: str, ctx: Any) -> None:
-        """Persist the index to ``uri`` (e.g. ``{user_space}/.index/evidence.json``)."""
+    def remove_session(self, session_uri: str) -> int:
+        """Remove one session's copies, including a single chunk of an episode."""
+        episodes = {}
+        removed = 0
+        for key, episode in self._episodes.items():
+            turns = [t for t in episode["turns"] if t["uri"].rstrip("/") != session_uri.rstrip("/")]
+            removed += len(episode["turns"]) - len(turns)
+            if turns:
+                episodes[key] = dict(episode, turns=turns)
+        if removed:
+            # Rebuild all lookup maps so lexical, semantic and source-ID paths
+            # cannot retain a deleted turn in memory.
+            rebuilt = type(self).from_dict({"episodes": episodes})
+            self.__dict__.update(rebuilt.__dict__)
+            self._dirty = True
+        return removed
+
+    async def save(self, viking_fs: Any, uri: str, ctx: Any, *, lease_ref=None) -> None:
+        """Persist while the caller holds the index read/modify/write lease."""
         if not self._dirty:
             return
         payload = json.dumps(self.to_dict(), ensure_ascii=False, indent=1)
-        try:
-            await viking_fs.write_file(uri=uri, content=payload, ctx=ctx)
-            self._dirty = False
-        except Exception as exc:  # pragma: no cover - fail-open
-            logger.warning("[evidence] index save failed: %s", exc)
+        await viking_fs.write_file(uri=uri, content=payload.encode("utf-8"), ctx=ctx, lease_ref=lease_ref)
+        self._dirty = False
     @classmethod
     async def load(cls, viking_fs: Any, uri: str, ctx: Any) -> "EvidenceIndex":
         try:
             content = await viking_fs.read_file(uri=uri, ctx=ctx)
-        except Exception:
-            return cls()
-        try:
-            data = json.loads(content)
-        except (TypeError, ValueError) as exc:
-            logger.warning("[evidence] index load parse failed: %s", exc)
-            return cls()
+        except Exception as exc:
+            from openviking.session.archive_store import is_storage_not_found
+            if is_storage_not_found(exc):
+                return cls()
+            raise
+        data = json.loads(content)
+        # Reject incomplete/unknown snapshots rather than silently dropping
+        # records and saving the resulting partial index on the next append.
+        if (not isinstance(data, dict) or data.get("version") not in {1, 2, cls.VERSION}
+                or not isinstance(data.get("episodes"), dict)):
+            raise ValueError("Invalid evidence index header")
+        for key, episode in data["episodes"].items():
+            if (not isinstance(episode, dict) or not isinstance(episode.get("turns"), list)
+                    or not isinstance(episode.get("session"), str)):
+                raise ValueError("Invalid evidence episode")
+            seen = set()
+            for turn in episode["turns"]:
+                if (not isinstance(turn, dict) or turn.get("episode") != key
+                        or type(turn.get("turn")) is not int or turn["turn"] < 0
+                        or turn["turn"] in seen
+                        or any(not isinstance(turn.get(f), str) for f in ("text", "speaker", "uri"))
+                        or any(not isinstance(turn.get(f), list) or
+                               any(not isinstance(v, str) for v in turn[f]) for f in ("keys", "ents"))):
+                    raise ValueError("Invalid evidence turn")
+                seen.add(turn["turn"])
         return cls.from_dict(data)
     # -- retrieval -------------------------------------------------------
     def retrieve(
@@ -716,6 +748,18 @@ class EvidenceIndex:
 # ---------------------------------------------------------------------------
 # Request-authorized loader
 # ---------------------------------------------------------------------------
+@asynccontextmanager
+async def evidence_index_lock(viking_fs: Any, uri: str, ctx: Any):
+    """Serialize the entire read/modify/write across workers and accounts."""
+    path = viking_fs._uri_to_path(uri, ctx=ctx)
+    agfs = viking_fs._async_agfs
+    lease = await agfs.pathlock_acquire_exact(path, timeout_secs=30)
+    try:
+        yield lease
+    finally:
+        await agfs.pathlock_release(lease)
+
+
 async def load_index(viking_fs: Any, uri: str, ctx: Any) -> "EvidenceIndex":
     """Read with current authorization and current persisted state.
 

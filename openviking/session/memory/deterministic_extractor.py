@@ -22,6 +22,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from typing import Any, Dict, List, Optional, Set, Tuple
 from openviking.session.memory.dataclass import ResolvedOperation, ResolvedOperations
+from openviking.session.memory.atomic_facts import select_user_facts, select_assistant_facts
 from openviking.session.memory.fact_records import alias_in_text, make_fact_records, merge_fact_records
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import generate_uri
@@ -29,6 +30,7 @@ from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 ENTITIES_MEMORY_TYPE = "entities"
 EVENTS_MEMORY_TYPE = "events"
+FACTS_MEMORY_TYPE = "facts"
 # ----------------------------------------------------------------------------
 # N3: bilingual anchor regex registry (dates / quantities)
 # Chinese forms are the original registry; English forms follow semantica's
@@ -665,6 +667,13 @@ class DeterministicMemoryExtractor:
         user_id = ctx.user.user_id
         errors: List[str] = []
         upserts: List[ResolvedOperation] = []
+        if self._type_allowed(allowed_memory_types, FACTS_MEMORY_TYPE):
+            try:
+                upserts.extend(self._extract_atomic_facts(extracted, user_id, extract_context))
+            except Exception as exc:
+                message = f"Deterministic fact extraction failed: {exc}"
+                logger.exception(message)
+                errors.append(message)
         if self._type_allowed(allowed_memory_types, ENTITIES_MEMORY_TYPE):
             try:
                 upserts.extend(
@@ -732,6 +741,66 @@ class DeterministicMemoryExtractor:
             return False
         schema = self._registry.get(memory_type)
         return bool(schema is not None and getattr(schema, "enabled", True))
+    def _extract_atomic_facts(
+        self, extracted: List[_ExtractedMsg], user_id: str, extract_context: Any
+    ) -> List[ResolvedOperation]:
+        schema = self._registry.get(FACTS_MEMORY_TYPE)
+        operations: List[ResolvedOperation] = []
+        previous_user = ""
+        seen: Set[str] = set()
+        for msg in extracted:
+            if msg.role == "user":
+                rows = select_user_facts(msg.text, msg.source_id, msg.ts, msg.speaker)
+                previous_user = msg.text
+                # A personal update is more useful than conversational filler.
+                rows.sort(key=lambda row: (row["quantity"] is not None,
+                                           row["time_expression"] is not None,
+                                           row["fact"]["predicate"] != "states"), reverse=True)
+                rows = rows[:4]
+            else:
+                rows = select_assistant_facts(msg.text, previous_user, msg.source_id, msg.ts)
+                rows = rows[:6]
+            for row in rows:
+                fact = row["fact"]
+                if fact["id"] in seen:
+                    continue
+                seen.add(fact["id"])
+                role = "assistant" if msg.role == "assistant" else "user"
+                source = fact["source_turn_ids"][0]
+                content = f"{role.title()} statement: {row['content'][:300]}\nSource: {source}"
+                if fact.get("recorded_at"):
+                    content += f"\nRecorded: {fact['recorded_at']}"
+                if row.get("context"):
+                    content += f"\nEarlier in the same source message: {row['context'][:100]}"
+                if row.get("quantity"):
+                    quantity = row["quantity"]
+                    object_text = f" {quantity['object']}" if quantity['object'] else ""
+                    content += f"\nQuantity: {quantity['value']}{object_text} ({quantity['status']})"
+                if row.get("scope"):
+                    content += f"\nScope: {row['scope']}"
+                if row.get("time_expression"):
+                    content += f"\nTime expression: {row['time_expression']}"
+                if fact.get("time"):
+                    content += f"\nEvent time: {fact['time']}"
+                content = content[:600]
+                memory_fields = {
+                    "speaker": role, "fact_id": fact["id"], "content": content,
+                    "fact_records": [fact], "source_turn_ids": fact["source_turn_ids"],
+                    "recorded_at": fact["recorded_at"],
+                    "assertion_type": fact["assertion_type"],
+                    "quantity": row.get("quantity"), "scope": row.get("scope"),
+                    "time_expression": row.get("time_expression"),
+                    "user_id": user_id,
+                }
+                uri = generate_uri(
+                    schema, {"speaker": role, "fact_id": fact["id"]},
+                    user_space=user_id, extract_context=extract_context,
+                )
+                operations.append(ResolvedOperation(
+                    old_memory_file_content=None, memory_fields=memory_fields,
+                    memory_type=FACTS_MEMORY_TYPE, uris=[uri],
+                ))
+        return operations
     def _get_nlp(self, lang: str = "zh"):
         return _load_nlp(self._ner_models.get(lang, "zh"))
     async def _entity_exists(self, uri: str, ctx: Any) -> bool:
@@ -814,8 +883,9 @@ class DeterministicMemoryExtractor:
             content = _build_entity_content(record, record.facts)
             if old_file is not None:
                 old_content = old_file.plain_content()
-                if not (old_file.extra_fields or {}).get("fact_records"):
-                    # Legacy relation bullets came from entity cross-products.
+                old_facts = (old_file.extra_fields or {}).get("fact_records", [])
+                if not old_facts or any(f.get("version") != 2 for f in old_facts if isinstance(f, dict)):
+                    # Legacy relations have not passed the current phrase parser.
                     old_content = "\n".join(line for line in old_content.splitlines()
                                             if not re.match(r"^- 与.+：", line))
                 content = _merge_entity_content(old_content, content)
@@ -938,7 +1008,7 @@ class DeterministicMemoryExtractor:
                 quote = fact["source_quotes"][msg.source_id]
                 for record in records.values():
                     aliases = record.aliases | {record.canonical}
-                    if any(alias_in_text(a, quote) or alias_in_text(a, fact["subject"])
+                    if any(alias_in_text(a, quote, record.category) or alias_in_text(a, fact["subject"], record.category)
                            or a.replace("_", " ").casefold() == msg.speaker.casefold()
                            for a in aliases):
                         if quote not in record.facts:

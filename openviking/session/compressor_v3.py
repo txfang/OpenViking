@@ -873,8 +873,8 @@ class SessionCompressorV3:
                 extract_context=extract_context,
             )
         except Exception:
-            logger.exception("Deterministic memory extraction failed; skipping commit")
-            return None
+            logger.exception("Deterministic memory extraction failed")
+            raise
 
     def _session_skill_extraction_enabled(self) -> bool:
         config = get_openviking_config()

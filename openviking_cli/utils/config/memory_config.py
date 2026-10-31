@@ -92,6 +92,14 @@ class MemoryConfig(BaseModel):
             "stateless deployments."
         ),
     )
+    deterministic_extract_enabled: bool | None = Field(
+        default=None,
+        description=(
+            "Use deterministic memory extraction when true, or the original ReAct "
+            "extractor when false. When unset, use OV_DETERMINISTIC_EXTRACT "
+            "(enabled by default; set to 0 to disable)."
+        ),
+    )
     extraction_output_format: Literal["json", "python"] = Field(
         default="python",
         description=(
