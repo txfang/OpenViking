@@ -349,7 +349,9 @@ class DirectoryInitializer:
                 created_targets.append(result)
         return created_targets, first_error
 
-    async def _ensure_agfs_directory(self, target: _DirectoryTarget) -> _DirectoryTarget | None:
+    async def _ensure_agfs_directory(
+        self, target: _DirectoryTarget, *, lease_ref: Optional[Dict] = None
+    ) -> _DirectoryTarget | None:
         """Fill missing L0/L1 files, preserving stored text for vector initialization."""
         from openviking_cli.utils.logger import get_logger
 
@@ -381,12 +383,22 @@ class DirectoryInitializer:
         if not missing:
             logger.debug(f"[VikingFS] Directory {target.uri} already exists")
             return None
+        if lease_ref is None:
+            # Recheck under a cross-worker lease before filling missing files.
+            # A tree lease also covers mkdir and both metadata sidecars.
+            path = viking_fs._uri_to_path(target.uri, ctx=target.ctx)
+            lease = await viking_fs._async_agfs.pathlock_acquire_tree(path, timeout_secs=30)
+            try:
+                return await self._ensure_agfs_directory(target, lease_ref=lease)
+            finally:
+                await viking_fs._async_agfs.pathlock_release(lease)
         logger.debug(f"[VikingFS] Creating directory: {target.uri} for scope {target.scope}")
         await viking_fs.write_context(
             uri=target.uri,
             **missing,
             is_leaf=False,
             ctx=target.ctx,
+            lease_ref=lease_ref,
         )
         return replace(target, definition=replace(target.definition, **contents))
 

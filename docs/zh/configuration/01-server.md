@@ -381,8 +381,12 @@ Provider 和密钥管理配置见[加密指南](../guides/08-encryption.md)。
 | `eager_prefetch` | boolean | `true` | 是否在抽取前预取并读取记忆内容 |
 | `prefetch_search_topn` | integer，`>= 1` | `5` | 预取时读取的检索结果数量 |
 | `extraction_enabled` | boolean | `true` | session commit 时是否抽取长期记忆 |
+| `spacy_model_zh` | string | `"zh_core_web_sm"` | 确定性抽取与原文证据检索共用的中文 spaCy 模型 |
+| `spacy_model_en` | string | `"en_core_web_sm"` | 确定性抽取与原文证据检索共用的英文 spaCy 模型 |
 | `session_skill_extraction_enabled` | boolean | `false` | 是否同时抽取可复用 Skill |
 | `link_enabled` | boolean | `false` | 是否生成和解析记忆链接 |
+
+使用大模型包时，在运行服务的 Python 环境安装 `zh_core_web_lg` 和 `en_core_web_lg`，并将 `memory.spacy_model_zh`、`memory.spacy_model_en` 分别设为对应名称。抽取和证据检索按文本的中日韩统一表意文字占比选择中英文模型；占比至少 10% 时使用中文模型。模型按名称缓存，安装或更换后需重启服务；加载失败会记录警告并使用已有降级路径。历史记忆及证据索引需重新抽取、重建才会应用新模型。
 
 自动提交还需要单独设置策略：记忆抽取开关不会让会话自动提交。详见[配置指南](../guides/01-configuration.md)的 `memory.session_auto_commit` 和[会话 API](../api/05-sessions.md)。模板目录的加载顺序和生效方式见 [Prompt 指南](../guides/10-prompt-guide.md)。
 

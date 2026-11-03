@@ -864,6 +864,8 @@ class SessionCompressorV3:
         extractor = DeterministicMemoryExtractor(
             registry=registry,
             viking_fs=get_viking_fs(),
+            ner_model=get_openviking_config().memory.spacy_model_zh,
+            ner_model_en=get_openviking_config().memory.spacy_model_en,
         )
         try:
             return await extractor.extract(

@@ -26,6 +26,7 @@ from openviking.session.memory.atomic_facts import select_user_facts, select_ass
 from openviking.session.memory.fact_records import alias_in_text, make_fact_records, merge_fact_records
 from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
 from openviking.session.memory.utils.uri import generate_uri
+from openviking.utils.spacy_utils import detect_language, load_spacy_model
 from openviking_cli.utils import get_logger
 logger = get_logger(__name__)
 ENTITIES_MEMORY_TYPE = "entities"
@@ -423,27 +424,12 @@ def _resolve_dates_in_text(text: str, ts: Optional[datetime]) -> Tuple[str, List
 # ----------------------------------------------------------------------------
 # N2: NER loader with regex-only degradation
 # ----------------------------------------------------------------------------
-_nlp_cache: Dict[str, Any] = {}
 def _load_nlp(ner_model: str):
-    if ner_model in _nlp_cache:
-        return _nlp_cache[ner_model]
-    try:
-        import spacy
-        nlp = spacy.load(ner_model)
-    except Exception as exc:  # pragma: no cover - environment dependent
-        logger.warning(
-            "spaCy NER unavailable (%s), falling back to regex-only extraction", exc
-        )
-        nlp = None
-    _nlp_cache[ner_model] = nlp
-    return nlp
-_CJK_RE = re.compile(r"[\u4e00-\u9fa5]")
+    return load_spacy_model(ner_model)
+
 def _detect_lang(text: str) -> str:
     """Route a message to zh or en based on CJK character ratio (zero-dep)."""
-    if not text.strip():
-        return "en"
-    ratio = len(_CJK_RE.findall(text)) / len(text)
-    return "zh" if ratio >= 0.1 else "en"
+    return detect_language(text)
 # ----------------------------------------------------------------------------
 # N5 / N7: title merge, alias aggregation, relation pairing
 # ----------------------------------------------------------------------------

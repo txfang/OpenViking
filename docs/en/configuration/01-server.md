@@ -382,8 +382,12 @@ See [Encryption](../guides/08-encryption.md) for provider and key-management set
 | `eager_prefetch` | boolean | `true` | Search and read memories before extraction |
 | `prefetch_search_topn` | integer, `>= 1` | `5` | Results read during prefetch |
 | `extraction_enabled` | boolean | `true` | Extract long-term memories on session commit |
+| `spacy_model_zh` | string | `"zh_core_web_sm"` | Chinese spaCy model shared by deterministic extraction and evidence retrieval |
+| `spacy_model_en` | string | `"en_core_web_sm"` | English spaCy model shared by deterministic extraction and evidence retrieval |
 | `session_skill_extraction_enabled` | boolean | `false` | Also extract reusable skills |
 | `link_enabled` | boolean | `false` | Generate and resolve memory links |
+
+To use large model packages, install `zh_core_web_lg` and `en_core_web_lg` in the server's Python environment and set `memory.spacy_model_zh` and `memory.spacy_model_en` to those names. Extraction and evidence retrieval use the Chinese model when CJK ideographs make up at least 10% of the text, and the English model otherwise. Models are cached by name; restart after installing or changing them. Loading failures log a warning and use the existing fallback paths. Re-extract historical memories and rebuild evidence indexes to apply the new models to existing data.
 
 Automatic commits require a separate policy; enabling memory extraction does not make sessions commit automatically. See `memory.session_auto_commit` in [Configuration](../guides/01-configuration.md) and the [Sessions API](../api/05-sessions.md). For template loading order and when changes take effect, see the [Prompt Guide](../guides/10-prompt-guide.md).
 

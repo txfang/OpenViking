@@ -100,6 +100,16 @@ class MemoryConfig(BaseModel):
             "(enabled by default; set to 0 to disable)."
         ),
     )
+    spacy_model_zh: str = Field(
+        default="zh_core_web_sm",
+        min_length=1,
+        description="Chinese spaCy model shared by deterministic extraction and evidence retrieval.",
+    )
+    spacy_model_en: str = Field(
+        default="en_core_web_sm",
+        min_length=1,
+        description="English spaCy model shared by deterministic extraction and evidence retrieval.",
+    )
     evidence_graph_write_enabled: bool = Field(
         default=False,
         description="Build derived evidence graph windows during session archive commits.",

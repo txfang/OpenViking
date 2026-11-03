@@ -37,6 +37,8 @@ from collections import defaultdict
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Set, Tuple
+from openviking.utils.spacy_utils import detect_language, load_spacy_model
+from openviking_cli.utils.config import get_openviking_config
 logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 # Deterministic lexical / entity extraction (ported from index_proto.py)
@@ -91,25 +93,17 @@ class EventNode:
     @property
     def has_members(self) -> bool:
         return bool(self.member_turns)
-_nlp = None
-def _get_nlp():
-    """Lazy-load the English spaCy model. Returns None on failure (fail-open)."""
-    global _nlp
-    if _nlp is not None:
-        return _nlp or None
-    try:
-        import spacy
-        _nlp = spacy.load("en_core_web_sm")
-    except Exception as exc:  # pragma: no cover - env dependent
-        logger.warning("[evidence] spaCy en_core_web_sm unavailable: %s", exc)
-        _nlp = False
-    return _nlp or None
+def _get_nlp(text: str = ""):
+    """Load the configured model for the text's language; default to English."""
+    config = get_openviking_config().memory
+    model = config.spacy_model_zh if detect_language(text) == "zh" else config.spacy_model_en
+    return load_spacy_model(model)
 def extract_keys(text: str) -> Tuple[List[str], Set[str]]:
     """Return (entities, lexical keys) for one turn text.
     Deterministic, zero LLM. Mirrors index_proto.extract_keys: spaCy NER
     entities (1-4 tokens, whitelisted labels) + lemma unigrams/bigrams.
     """
-    nlp = _get_nlp()
+    nlp = _get_nlp(text)
     if nlp is None:
         return [], set()
     try:
@@ -124,7 +118,11 @@ def extract_keys(text: str) -> Tuple[List[str], Set[str]]:
             if 1 <= len(t.split()) <= 4:
                 ents.append(t)
     toks = [t for t in doc if t.is_alpha and t.text.lower() not in _STOP and len(t.text) > 1]
-    lemmas = [t.lemma_.lower() for t in toks if t.pos_ in _KEEP_POS and len(t.lemma_) > 2]
+    min_length = 2 if detect_language(text) == "zh" else 3
+    lemmas = [
+        (t.lemma_ or t.text).lower() for t in toks
+        if t.pos_ in _KEEP_POS and len(t.lemma_ or t.text) >= min_length
+    ]
     bigrams = [f"{lemmas[i]}_{lemmas[i + 1]}" for i in range(len(lemmas) - 1)]
     keys = set(lemmas) | set(bigrams)
     return ents, keys
@@ -134,7 +132,7 @@ def extract_labeled_ents(text: str) -> Dict[str, Set[str]]:
     entities at query time (``extract_keys`` deliberately drops labels).
     Deterministic, zero LLM.
     """
-    nlp = _get_nlp()
+    nlp = _get_nlp(text)
     if nlp is None:
         return {}
     try:

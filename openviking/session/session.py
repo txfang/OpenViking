@@ -1430,39 +1430,42 @@ class Session:
         user_space = self._session_uri.rsplit("/sessions/", 1)[0]
         uri = f"{user_space}/.index/evidence.json"
         try:
+            turns = []
+            for m in messages:
+                text = m.content
+                if not text:
+                    continue
+                sm = _EVIDENCE_SPEAKER_RE.match(text)
+                turns.append(
+                {
+                    "id": m.id,
+                    "speaker": sm.group(1).strip() if sm else (m.peer_id or m.role or ""),
+                    "text": text,
+                    "date": m.created_at or "",
+                }
+                )
+            # ALG-A semantic channel: embed each turn text once at write
+            # time (bge dense vectors; zero LLM / zero token). Fail-open:
+            # no embedder or failed embed -> None entries, retrieval
+            # degrades to the four-channel path.
+            embeddings: Optional[List[Optional[List[float]]]] = None
+            if turns:
+                try:
+                    embedder = get_openviking_config().embedding.get_embedder()
+                    if embedder is not None:
+                        embeddings = await asyncio.to_thread(
+                            _embed_turn_texts,
+                            embedder,
+                            [t["text"] for t in turns],
+                        )
+                except Exception as exc: # pragma: no cover - fail-open
+                    logger.warning("[evidence] embedder unavailable: %s", exc)
+            graph_enabled = get_openviking_config().memory.evidence_graph_write_enabled
+            # commit_async retains the session lease throughout this hook.
+            # Keep model I/O outside the shared user index lease so unrelated
+            # sessions can append while this session waits for embeddings.
             async with evidence_index_lock(self._viking_fs, uri, self.ctx) as lease:
                 index = await load_index(self._viking_fs, uri, self.ctx)
-                turns = []
-                for m in messages:
-                    text = m.content
-                    if not text:
-                        continue
-                    sm = _EVIDENCE_SPEAKER_RE.match(text)
-                    turns.append(
-                    {
-                        "id": m.id,
-                        "speaker": sm.group(1).strip() if sm else (m.peer_id or m.role or ""),
-                        "text": text,
-                        "date": m.created_at or "",
-                    }
-                    )
-                # ALG-A semantic channel: embed each turn text once at write
-                # time (bge dense vectors; zero LLM / zero token). Fail-open:
-                # no embedder or failed embed -> None entries, retrieval
-                # degrades to the four-channel path.
-                embeddings: Optional[List[Optional[List[float]]]] = None
-                if turns:
-                    try:
-                        embedder = get_openviking_config().embedding.get_embedder()
-                        if embedder is not None:
-                            embeddings = await asyncio.to_thread(
-                                _embed_turn_texts,
-                                embedder,
-                                [t["text"] for t in turns],
-                            )
-                    except Exception as exc: # pragma: no cover - fail-open
-                        logger.warning("[evidence] embedder unavailable: %s", exc)
-                graph_enabled = get_openviking_config().memory.evidence_graph_write_enabled
                 if index.append_chunk(self.session_id, turns, user_space, embeddings,
                                       archive_uri=archive_uri, graph_enabled=graph_enabled):
                     await index.save(self._viking_fs, uri, self.ctx, lease_ref=lease)
