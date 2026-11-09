@@ -69,6 +69,8 @@ def _apply_scalar_overrides(embedding_msg, overrides: Optional[Dict[str, Any]]) 
     if record_id:
         # Internal queue metadata, removed by TextEmbeddingHandler before upsert.
         embedding_msg.context_data["_upsert_record_id"] = str(record_id)
+    if overrides.get("_memory_revision"):
+        embedding_msg.context_data["_memory_revision"] = overrides["_memory_revision"]
     for field, value in overrides.items():
         if field.startswith("_") or field in NON_PORTABLE_VECTOR_RECORD_FIELDS or value is None:
             continue

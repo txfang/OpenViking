@@ -887,6 +887,10 @@ class DeterministicMemoryExtractor:
                 "confidence": _confidence(key),
                 "user_id": user_id,
                 "fact_records": fact_records,
+                "source_turn_ids": sorted(set(
+                    (old_file.extra_fields or {}).get("source_turn_ids", []) if old_file else []
+                ) | {msg.source_id for msg in extracted
+                     if msg.source_id and set(msg.indices or [msg.index]) & set(record.msg_indices)}),
             }
             ops.append(
                 ResolvedOperation(

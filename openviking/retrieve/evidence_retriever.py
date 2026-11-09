@@ -183,7 +183,7 @@ class EvidenceIndex:
     Inverted maps are rebuilt from episodes at load time (kept in-memory only,
     not persisted, to avoid drift).
     """
-    VERSION = 4
+    VERSION = 5
     DEFAULT_EPI_WINDOW = 4
     DEFAULT_TOP_K = 15
     DEFAULT_SEM_ANCHOR_TOP = 3
@@ -195,6 +195,10 @@ class EvidenceIndex:
         self._turn_keys: Dict[str, Set[str]] = {}  # turn id -> keys
         self._turn_by_id: Dict[str, Dict[str, Any]] = {}  # turn id -> turn dict
         self._source_inv: Dict[str, Set[str]] = defaultdict(set)
+        # Durable revocations also reject stale, already-running extractions.
+        self.source_invalidations: Dict[str, str] = {}
+        self.pending_memory_cleanup: List[str] = []
+        self.pending_source_updates: List[str] = []
         self._n_turns = 0
         self._dirty = False
         from openviking.retrieve.evidence_graph import empty_graph
@@ -489,10 +493,27 @@ class EvidenceIndex:
         return f"{user_space.rstrip('/')}/sessions/{session_id}"
     # -- serialization ---------------------------------------------------
     def to_dict(self) -> Dict[str, Any]:
-        return {"version": self.VERSION, "episodes": self._episodes, "graph": self.graph}
+        return {"version": self.VERSION, "episodes": self._episodes, "graph": self.graph,
+                "source_invalidations": self.source_invalidations,
+                "pending_memory_cleanup": self.pending_memory_cleanup,
+                "pending_source_updates": self.pending_source_updates}
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "EvidenceIndex":
         index = cls()
+        invalidations = data.get("source_invalidations", {})
+        pending = data.get("pending_memory_cleanup", [])
+        updates = data.get("pending_source_updates", [])
+        if (not isinstance(invalidations, dict)
+                or any(not isinstance(k, str) or not isinstance(v, str)
+                       for k, v in invalidations.items())
+                or not isinstance(pending, list)
+                or any(not isinstance(uri, str) for uri in pending)
+                or not isinstance(updates, list)
+                or any(not isinstance(sid, str) for sid in updates)):
+            raise ValueError("Invalid source lifecycle state")
+        index.source_invalidations = dict(invalidations)
+        index.pending_memory_cleanup = list(pending)
+        index.pending_source_updates = list(updates)
         episodes = data.get("episodes", {}) if isinstance(data, dict) else {}
         for episode_key, ep in episodes.items():
             if not isinstance(ep, dict):
@@ -504,10 +525,10 @@ class EvidenceIndex:
             for turn in turns:
                 index._index_turn(turn)
                 index._n_turns += 1
-        if data.get("version") != cls.VERSION:
+        if data.get("version") not in {4, cls.VERSION}:
             index.graph["needs_rebuild"] = True
             index.graph_unavailable = True
-        if data.get("version") == cls.VERSION:
+        if data.get("version") in {4, cls.VERSION}:
             try:
                 graph = data["graph"]
                 if not isinstance(graph, dict) or any(not isinstance(graph.get(k), dict)
@@ -581,6 +602,9 @@ class EvidenceIndex:
             surviving_edges = {key: edge for key, edge in self.graph["appears_in"].items()
                                if edge["window_id"] in surviving}
             rebuilt = type(self).from_dict({"version": self.VERSION, "episodes": episodes,
+                                           "source_invalidations": self.source_invalidations,
+                                           "pending_memory_cleanup": self.pending_memory_cleanup,
+                                           "pending_source_updates": self.pending_source_updates,
                                            "graph": {"windows": surviving, "appears_in": surviving_edges,
                                                      "adjacent": {}, "pending_archive_uris": pending,
                                                      "needs_rebuild": self.graph.get("needs_rebuild", False)}})
@@ -590,6 +614,31 @@ class EvidenceIndex:
             self.__dict__.update(rebuilt.__dict__)
             self._dirty = True
         return removed
+
+    def invalidate_sources(self, source_ids: List[str], session_uri: str) -> None:
+        for source_id in source_ids:
+            self.source_invalidations[source_id] = session_uri
+        self._dirty = True
+
+    def replace_source(self, source_id: str, text: str, speaker: str,
+                       date: str, embedding=None) -> None:
+        """Replace one unambiguous turn without changing its graph membership."""
+        turns = self.resolve_sources([source_id])
+        if len(turns) != 1:
+            raise ValueError("Source message is missing or ambiguous")
+        turn = self._turn_by_id[self._turn_id(turns[0]["episode"], turns[0]["turn"])]
+        ents, keys = extract_keys(text)
+        turn.update(text=text, speaker=speaker, date=date, ents=sorted(ents), keys=sorted(keys))
+        turn.pop("emb", None)
+        if embedding:
+            turn["emb"] = list(embedding)
+        rebuilt = type(self).from_dict(self.to_dict())
+        for window in list(rebuilt.graph["windows"].values()):
+            if source_id in {rebuilt._turn_by_id[tid].get("source_id") for tid in window["turn_ids"]}:
+                rebuilt._add_graph_window(window["archive_uri"], window["session_uri"],
+                                          window["episode"], window["turn_ids"])
+        self.__dict__.update(rebuilt.__dict__)
+        self._dirty = True
 
     async def save(self, viking_fs: Any, uri: str, ctx: Any, *, lease_ref=None) -> None:
         """Persist while the caller holds the index read/modify/write lease."""
@@ -610,7 +659,7 @@ class EvidenceIndex:
         data = json.loads(content)
         # Reject incomplete/unknown snapshots rather than silently dropping
         # records and saving the resulting partial index on the next append.
-        if (not isinstance(data, dict) or data.get("version") not in {1, 2, 3, cls.VERSION}
+        if (not isinstance(data, dict) or data.get("version") not in {1, 2, 3, 4, cls.VERSION}
                 or not isinstance(data.get("episodes"), dict)):
             raise ValueError("Invalid evidence index header")
         for key, episode in data["episodes"].items():
@@ -990,11 +1039,16 @@ async def rebuild_graph_from_archives(viking_fs: Any, user_uri: str, ctx: Any,
         return dict(report, archive_count=len(groups), dry_run=dry_run)
 
 
-async def load_index(viking_fs: Any, uri: str, ctx: Any) -> "EvidenceIndex":
+async def load_index(viking_fs: Any, uri: str, ctx: Any, *, allow_pending=False) -> "EvidenceIndex":
     """Read with current authorization and current persisted state.
 
     Mutable URI-only caches can leak across accounts or bypass revocation.
     The session commit hook serializes read->append->save; loading fresh also
     prevents stale snapshots from overwriting another caller's appended turns.
     """
-    return await EvidenceIndex.load(viking_fs, uri, ctx)
+    index = await EvidenceIndex.load(viking_fs, uri, ctx)
+    if index.pending_source_updates and not allow_pending:
+        from openviking_cli.exceptions import ConflictError
+
+        raise ConflictError("Source correction is incomplete; retry the correction before using this index")
+    return index

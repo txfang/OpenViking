@@ -813,12 +813,15 @@ class MemoryUpdater:
         registry: Optional[MemoryTypeRegistry] = None,
         vikingdb=None,
         transaction_handle: Any = None,
+        strict_index_errors: bool = False,
     ):
         """Create a memory updater with an optional pathlock transaction handle."""
         self._viking_fs = None
         self._registry = registry
         self._vikingdb = vikingdb
         self._transaction_handle = transaction_handle
+        self._strict_index_errors = strict_index_errors
+        self._source_guard_indexes = {}
 
     def _get_viking_fs(self):
         """Get or create VikingFS instance."""
@@ -910,6 +913,7 @@ class MemoryUpdater:
         search_tags_by_uri: Dict[str, List[str]] = None,
     ) -> MemoryUpdateResult:
         result = MemoryUpdateResult()
+        self._source_guard_indexes = {}
         viking_fs = self._get_viking_fs()
 
         if not viking_fs:
@@ -1120,6 +1124,7 @@ class MemoryUpdater:
             extract_context=extract_context,
             uri_memory_type_map=uri_memory_type_map,
             search_tags_by_uri=effective_search_tags_by_uri,
+            raise_on_enqueue_failure=self._strict_index_errors,
         )
 
         # Apply links to endpoint files not covered by upsert_operations
@@ -1150,13 +1155,16 @@ class MemoryUpdater:
             )
 
         for dir, memory_type in dirs.items():
-            await self.generate_overview(
+            generated = await self.generate_overview(
                 memory_type,
                 dir,
                 ctx,
                 extract_context,
                 lease_ref=self._transaction_handle,
             )
+            schema = self._registry.get(memory_type)
+            if self._strict_index_errors and schema and schema.overview_template and not generated:
+                raise RuntimeError(f"Failed to refresh memory overview: {dir}")
 
         return result
 
@@ -1564,6 +1572,20 @@ class MemoryUpdater:
                 elif existing_backlinks:
                     metadata["backlinks"] = existing_backlinks
 
+            if metadata.get("fact_records") or metadata.get("source_turn_ids"):
+                from openviking.session.memory.source_cleanup import guard_source_update
+                from openviking.retrieve.evidence_retriever import load_index
+
+                metadata["memory_type"] = memory_type
+                root = uri.split("/memories/", 1)[0]
+                guard_key = (ctx.account_id, root)
+                if guard_key not in self._source_guard_indexes:
+                    self._source_guard_indexes[guard_key] = await load_index(
+                        viking_fs, root + "/.index/evidence.json", ctx)
+                metadata = await guard_source_update(
+                    viking_fs, metadata, uri, ctx, index=self._source_guard_indexes[guard_key])
+                if metadata is None:
+                    raise ConflictError("Memory sources were deleted or corrected; re-extract", resource=uri)
             mf = MemoryFile.from_parsed(uri=uri, parsed=metadata)
             new_full_content = MemoryFileUtils.write(
                 mf,
@@ -1904,6 +1926,9 @@ class MemoryUpdater:
                 # Convert to embedding msg and enqueue
                 embedding_msg = EmbeddingMsgConverter.from_context(memory_context)
                 if embedding_msg:
+                    embedding_msg.context_data["_memory_revision"] = hashlib.sha256(
+                        content.encode("utf-8")
+                    ).hexdigest()
                     if getattr(ingest_options, "search_tags", None) is not None:
                         embedding_msg.context_data["search_tags"] = list(ingest_options.search_tags)
                         embedding_msg.context_data["_upsert_options"] = {
@@ -2057,6 +2082,8 @@ class MemoryUpdater:
                 )
             except Exception as e:
                 tracer.error(f"Failed to parse {file_path}: {e}")
+                if self._strict_index_errors:
+                    raise
                 continue
 
         if not items:
@@ -2109,6 +2136,11 @@ class MemoryUpdater:
                 context_type="memory",
                 ctx=ctx,
                 include_abstract=False,
+                scalar_overrides={int(ContextLevel.OVERVIEW.value): {
+                    "_memory_revision": hashlib.sha256(
+                        (await viking_fs.read_file(overview_path, ctx=ctx)).encode("utf-8")
+                    ).hexdigest(),
+                }},
             )
             return True
         except Exception as e:

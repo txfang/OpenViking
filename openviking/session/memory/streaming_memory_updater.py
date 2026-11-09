@@ -508,6 +508,7 @@ class StreamingMemoryUpdater:
                     registry=request.memory_registry or self.registry,
                     vikingdb=self.vikingdb,
                     transaction_handle=lease,
+                    strict_index_errors=request.strict_extract_errors,
                 )
                 return await updater.apply_operations(
                     operations,

@@ -7,6 +7,7 @@ Session as Context: Sessions integrated into L0/L1/L2 system.
 
 import asyncio
 import copy
+import hashlib
 import inspect
 import json
 import re
@@ -1216,6 +1217,7 @@ class Session:
         agent_evolution_enabled: bool = True,
         agent_memory_skip_reason: Optional[str] = None,
         lease_ref: Optional[Any] = None,
+        retry_fingerprint: Optional[str] = None,
     ) -> None:
         """Persist the Phase 1 intent before any destructive root rewrite."""
         payload = {
@@ -1232,6 +1234,8 @@ class Session:
             "retained_message_token_budget": retained_message_token_budget,
             "min_raw_tail_steps": min_raw_tail_steps,
         }
+        if retry_fingerprint is not None:
+            payload["retry_fingerprint"] = retry_fingerprint
         await self._merge_archive_meta(
             archive_uri,
             {
@@ -1243,6 +1247,48 @@ class Session:
             },
             lease_ref=lease_ref,
         )
+
+    async def _can_reuse_evidence_archive(
+        self,
+        archive_uri: str,
+        retry_fingerprint: str,
+        messages: List[Message],
+    ) -> bool:
+        """Match an unpublished Phase 1 intent while holding the Session lock."""
+        if await self._viking_fs.exists(f"{archive_uri}/.done", ctx=self.ctx):
+            return False
+        try:
+            meta = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.meta.json", ctx=self.ctx)
+            )
+        except Exception as exc:
+            if _is_storage_not_found(exc):
+                return False
+            raise
+        phase1 = meta.get("phase1", {})
+        if (
+            phase1.get("status") != "preparing"
+            or phase1.get("retry_fingerprint") != retry_fingerprint
+        ):
+            return False
+        try:
+            failed = json.loads(
+                await self._viking_fs.read_file(f"{archive_uri}/.failed.json", ctx=self.ctx)
+            )
+        except Exception as exc:
+            if not _is_storage_not_found(exc):
+                raise
+            # A crash may precede the failure marker or follow its removal.
+            # A matching preparing intent has never published Phase 2 work.
+            failed = None
+        if failed is not None and (
+            not isinstance(failed, dict) or failed.get("stage") != "evidence_index"
+        ):
+            return False
+        archived = await self._archives.read_messages(archive_uri)
+        return [message.to_dict() for message in archived] == [
+            message.to_dict() for message in messages
+        ]
 
     async def _write_phase1_ready_marker(
         self,
@@ -1416,17 +1462,13 @@ class Session:
     async def _append_to_evidence_index(self, messages: List[Message], archive_uri: str) -> None:
         """Write-time incremental append of archived turns to the evidence index.
         Zero-Mem/EdgeMem style lexical + entity index pointing back at the
-        archived raw turns. Fail-open: any failure here degrades to a warning
-        and never affects the commit path. Encoded imports retain their
+        archived raw turns. Index read/write failures abort Phase 1 before
+        rewriting live messages. Encoded imports retain their
         episode numbering; ordinary sessions append by stable message ID.
         """
         if not self._viking_fs or not messages:
             return
-        try:
-            from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
-        except Exception as exc: # pragma: no cover - env dependent
-            logger.debug("[evidence] module unavailable: %s", exc)
-            return
+        from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
         user_space = self._session_uri.rsplit("/sessions/", 1)[0]
         uri = f"{user_space}/.index/evidence.json"
         try:
@@ -1469,8 +1511,9 @@ class Session:
                 if index.append_chunk(self.session_id, turns, user_space, embeddings,
                                       archive_uri=archive_uri, graph_enabled=graph_enabled):
                     await index.save(self._viking_fs, uri, self.ctx, lease_ref=lease)
-        except Exception as exc: # pragma: no cover - derived index is best effort
-            logger.warning("[evidence] index append failed: %s", exc)
+        except Exception:
+            logger.exception("[evidence] index append failed")
+            raise
 
     @tracer("session.commit.phase1")
     async def commit_async(
@@ -1745,7 +1788,42 @@ class Session:
                     "budget_exceeded": retention_plan.budget_exceeded if retention_plan else False,
                 }
 
-            self._compression.compression_index += 1
+            # Match the full live snapshot and effective policy, not only IDs:
+            # messages may have been corrected or appended since the failure.
+            retry_fingerprint = hashlib.sha256(
+                json.dumps(
+                    {
+                        "messages": [message.to_dict() for message in self._messages],
+                        "archived_ids": [message.id for message in messages_to_archive],
+                        "retained_ids": [message.id for message in retained_messages],
+                        "memory_policy": effective_memory_policy,
+                        "event_tags": effective_event_tags,
+                        "auto_commit_policy": self._meta.auto_commit_policy,
+                        "agent_evolution_enabled": agent_evolution_enabled,
+                        "keep_recent_count": keep_recent_count,
+                        "stored_keep_recent_count": stored_keep_recent_count,
+                        "retention_mode": retention_mode,
+                        "keep_recent_turn_count": effective_keep_turns if turn_mode else 0,
+                        "retained_message_token_budget": effective_token_budget if turn_mode else 0,
+                        "min_raw_tail_steps": effective_min_tail,
+                        "record_auto_commit_success": record_auto_commit_success,
+                        "record_idle_commit_success": record_idle_commit_success,
+                        "reset_context": reset_context,
+                    },
+                    sort_keys=True,
+                    ensure_ascii=False,
+                ).encode("utf-8")
+            ).hexdigest()
+            previous_archive_uri = (
+                f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
+            )
+            reuse_archive = self._compression.compression_index > 0 and (
+                await self._can_reuse_evidence_archive(
+                    previous_archive_uri, retry_fingerprint, messages_to_archive
+                )
+            )
+            if not reuse_archive:
+                self._compression.compression_index += 1
             archive_uri = (
                 f"{self._session_uri}/history/archive_{self._compression.compression_index:03d}"
             )
@@ -1778,9 +1856,10 @@ class Session:
                         min_raw_tail_steps=effective_min_tail,
                         agent_evolution_enabled=agent_evolution_enabled,
                         agent_memory_skip_reason=agent_memory_skip_reason,
+                        retry_fingerprint=retry_fingerprint,
                     )
                 ]
-                if self._viking_fs:
+                if self._viking_fs and not reuse_archive:
                     lines = [m.to_jsonl() for m in messages_to_archive]
                     archive_persist_tasks.append(
                         self._viking_fs.write_file(
@@ -1808,9 +1887,12 @@ class Session:
                             )
                         },
                     )
-                # Zero-Mem evidence index: write-time incremental append of the
-                # archived raw turns (fail-open; never blocks the commit).
+                phase1_stage = "evidence_index"
                 await self._append_to_evidence_index(messages_to_archive, archive_uri)
+                if reuse_archive:
+                    await self._viking_fs.rm(
+                        f"{archive_uri}/.failed.json", ctx=self.ctx, no_vector=True
+                    )
 
                 phase1_stage = "phase1_persist"
                 self._messages = retained_messages
@@ -1888,6 +1970,19 @@ class Session:
                             archive_uri,
                         )
                     publication_lease = None
+                if phase1_stage == "evidence_index":
+                    error = (None if isinstance(e, ValueError) else map_exception(e))
+                    error = error or InternalError("Evidence index update failed")
+                    error.details.update(
+                        stage="evidence_index",
+                        archive_uri=archive_uri,
+                        archive_persisted=True,
+                        archived=False,
+                        live_messages_preserved=True,
+                    )
+                    if error is e:
+                        raise
+                    raise error from e
                 raise
         finally:
             await self._viking_fs._async_agfs.pathlock_release(lease)

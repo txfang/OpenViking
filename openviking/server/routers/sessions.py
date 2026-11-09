@@ -773,6 +773,24 @@ async def add_message(
     return Response(status="ok", result=execution.result, telemetry=execution.telemetry)
 
 
+class CorrectMessageRequest(BaseModel):
+    content: str = Field(..., min_length=1)
+    model_config = {"extra": "forbid"}
+
+
+@router.put("/{session_id}/messages/{message_id}")
+async def correct_message(
+    request: CorrectMessageRequest,
+    session_id: str = Path(..., description="Session ID"),
+    message_id: str = Path(..., description="Stable source message ID"),
+    _ctx: RequestContext = Depends(get_session_request_context),
+):
+    """Replace plain text and rebuild its source-backed memories."""
+    service = get_service()
+    result = await service.sessions.correct_message(session_id, message_id, request.content, _ctx)
+    return Response(status="ok", result=result)
+
+
 @router.post("/{session_id}/messages/batch")
 async def batch_add_messages(
     request: BatchAddMessageRequest,

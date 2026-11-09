@@ -13,7 +13,7 @@ import json
 import logging
 import threading
 import time
-from contextlib import nullcontext
+from contextlib import asynccontextmanager, nullcontext
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 
@@ -499,6 +499,47 @@ class TextEmbeddingHandler(DequeueHandlerBase):
         self._breaker_open_last_log_at: Dict[str, float] = {}
         self._breaker_open_log_interval = 30.0
 
+    @staticmethod
+    @asynccontextmanager
+    async def _memory_write_guard(uri, revision, ctx, level=None, legacy_abstract=None):
+        """Do not publish vectors queued before a source cleanup or correction."""
+        if revision is None and legacy_abstract is None:
+            yield True
+            return
+        from openviking.storage.viking_fs import get_viking_fs
+        from openviking_cli.exceptions import NotFoundError
+
+        fs = get_viking_fs()
+        lease = await fs._async_agfs.pathlock_acquire_exact(
+            fs._uri_to_path(uri, ctx=ctx), timeout_secs=30)
+        try:
+            try:
+                source_uri = uri
+                if level in (0, 1):
+                    source_uri = uri.rstrip("/") + ("/.abstract.md" if level == 0 else "/.overview.md")
+                content = await fs.read_file(source_uri, ctx=ctx)
+            except (NotFoundError, FileNotFoundError):
+                yield False
+                return
+            if revision is not None:
+                current = hashlib.sha256(content.encode("utf-8")).hexdigest() == revision
+            elif level in (0, 1):
+                from openviking.storage.abstract_overview import body_for_preview
+                from openviking.utils.embedding_utils import _truncate_abstract_bytes
+
+                current = _truncate_abstract_bytes(body_for_preview(content)) == legacy_abstract
+            else:
+                from openviking.session.memory.memory_updater import MemoryUpdater
+                from openviking.session.memory.utils.link_renderer import LinkRenderer
+                from openviking.session.memory.utils.memory_file_utils import MemoryFileUtils
+
+                body = MemoryFileUtils.read(content, uri=uri).content
+                current = MemoryUpdater._truncate_memory_abstract(
+                    LinkRenderer.strip_all_links(body or "")) == legacy_abstract
+            yield current
+        finally:
+            await fs._async_agfs.pathlock_release(lease)
+
     def _log_breaker_open_reenqueue_summary(self, account_id: str) -> None:
         """Log a throttled warning when embeddings are re-enqueued due to an open circuit breaker."""
         now = time.monotonic()
@@ -913,20 +954,35 @@ class TextEmbeddingHandler(DequeueHandlerBase):
                     upsert_options = normalize_upsert_options(
                         {**raw_upsert_options, "partial_update": False}
                     )
-                    if inserted_data.get("context_type") == ContextType.SKILL.value:
-                        # Cancelling the waiter cannot stop a threaded DB write.
-                        # Keep this task active until that write has settled.
-                        result = await run_to_completion(
-                            lambda: self._vikingdb.upsert(
-                                inserted_data, ctx=ctx, options=upsert_options
+                    revision = inserted_data.get("_memory_revision")
+                    level = inserted_data.get("level")
+                    legacy_abstract = None
+                    if (revision is None and inserted_data.get("context_type") == "memory"
+                            and "/memories/" in uri and level in (0, 1, 2)):
+                        legacy_abstract = inserted_data.get("abstract") or ""
+                    if revision is not None:
+                        inserted_data = {key: value for key, value in inserted_data.items()
+                                         if key != "_memory_revision"}
+                    async with self._memory_write_guard(
+                        uri, revision, ctx, level, legacy_abstract
+                    ) as current:
+                        if not current:
+                            self._merge_request_stats(embedding_msg.telemetry_id, processed=1)
+                            return ProcessResult.success()
+                        if (inserted_data.get("context_type") == ContextType.SKILL.value
+                                or revision is not None or legacy_abstract is not None):
+                            # Keep a memory's lease until a threaded write settles.
+                            result = await run_to_completion(
+                                lambda: self._vikingdb.upsert(
+                                    inserted_data, ctx=ctx, options=upsert_options
+                                )
                             )
-                        )
-                    else:
-                        result = await self._vikingdb.upsert(
-                            inserted_data,
-                            ctx=ctx,
-                            options=upsert_options,
-                        )
+                        else:
+                            result = await self._vikingdb.upsert(
+                                inserted_data,
+                                ctx=ctx,
+                                options=upsert_options,
+                            )
                     record_id = result
                     if record_id:
                         logger.debug(

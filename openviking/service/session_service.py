@@ -7,6 +7,7 @@ Provides session management operations: session, sessions, add_message, commit, 
 """
 
 import asyncio
+import json
 from dataclasses import replace
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING, Any, Dict, List, Optional
@@ -41,6 +42,8 @@ from openviking.utils.time_utils import parse_iso_datetime
 from openviking_cli.exceptions import (
     AlreadyExistsError,
     ConflictError,
+    InternalError,
+    InvalidArgumentError,
     NotFoundError,
     NotInitializedError,
 )
@@ -423,11 +426,24 @@ class SessionService:
                 raise ConflictError("Session was created concurrently; retry deletion")
             index_uri = f"{session_uri.rsplit('/sessions/', 1)[0]}/.index/evidence.json"
             async with evidence_index_lock(fs, index_uri, ctx) as index_lease:
-                index = await load_index(fs, index_uri, ctx)
-                if index.remove_session(session_uri):
+                index = await load_index(fs, index_uri, ctx, allow_pending=True)
+                source_ids = {turn["source_id"] for turn in index._turn_by_id.values()
+                              if turn["uri"].rstrip("/") == session_uri and turn.get("source_id")}
+                source_ids.update(sid for sid, uri in index.source_invalidations.items()
+                                  if uri == session_uri)
+                removed = index.remove_session(session_uri)
+                index.pending_source_updates = [sid for sid in index.pending_source_updates
+                                                if sid not in source_ids]
+                if source_ids:
+                    index.invalidate_sources(sorted(source_ids), session_uri)
+                if removed or source_ids:
                     # Purge first: failure must leave the authoritative session
                     # intact and must not report successful deletion.
                     await index.save(fs, index_uri, ctx, lease_ref=index_lease)
+                from openviking.session.memory.source_cleanup import cleanup_source_memories
+
+                await cleanup_source_memories(fs, index, index_uri, index_lease,
+                                              source_ids, ctx, vikingdb=self._vikingdb)
                 if not exists:
                     # Also repairs copies left by older versions on a retry.
                     self._record_lifecycle_metric("delete", "error")
@@ -445,6 +461,155 @@ class SessionService:
         logger.info(f"Deleted session: {session_id}")
         self._record_lifecycle_metric("delete", "ok")
         return True
+
+    async def _source_message_files(self, session_uri: str, ctx: RequestContext):
+        """Read authoritative JSONL only; derived summaries are not sources."""
+        from openviking.message import Message
+
+        paths = [session_uri + "/messages.jsonl"]
+        history = session_uri + "/history"
+        if await self._viking_fs.exists(history, ctx=ctx):
+            listing = await self._viking_fs.glob("*/messages.jsonl", uri=history,
+                                                 ctx=ctx, force_fs=True)
+            if listing.get("truncated"):
+                raise ConflictError("Archive listing was truncated")
+            paths.extend(listing["matches"])
+        result = []
+        for path in paths:
+            try:
+                raw = await self._viking_fs.read_file(path, ctx=ctx)
+            except (NotFoundError, FileNotFoundError):
+                continue
+            result.append((path, [Message.from_dict(json.loads(line))
+                                  for line in raw.split("\n") if line.strip()]))
+        return result
+
+    async def correct_message(self, session_id: str, message_id: str, content: str,
+                              ctx: RequestContext) -> Dict[str, Any]:
+        """Correct a text message, revoke old facts and synchronously re-extract."""
+        from openviking.message import TextPart
+        from openviking.retrieve.evidence_retriever import evidence_index_lock, load_index
+        from openviking.session.memory.source_cleanup import cleanup_source_memories
+        from openviking.storage.acl import AclAction
+
+        self._ensure_initialized()
+        if not content.strip():
+            raise InvalidArgumentError("Corrected message content must not be empty")
+        fs = self._viking_fs
+        session_uri = canonical_session_uri(ctx, session_id)
+        await fs._ensure_access(session_uri, ctx, action=AclAction.MANAGE)
+        session = await self.get(session_id, ctx, auto_create=False)
+        lease = await fs._async_agfs.pathlock_acquire_tree(
+            fs._uri_to_path(session_uri, ctx=ctx), timeout_secs=30)
+        stage = "prepare"
+        try:
+            if await get_task_tracker().has_running("session_commit", session_id,
+                    account_id=ctx.account_id, user_id=ctx.user.user_id):
+                raise ConflictError("Session commit is running; retry correction after it finishes")
+            files = await self._source_message_files(session_uri, ctx)
+            affected = [(path, messages) for path, messages in files
+                        if any(message.id == message_id for message in messages)]
+            if not affected:
+                raise NotFoundError(message_id, "message")
+            if self._privacy_config_service is not None:
+                from openviking.privacy.session_extractor import extract_and_store_session_privacy
+
+                protected = await extract_and_store_session_privacy(
+                    session_id, [{"parts": [TextPart(content)]}], ctx,
+                    self._privacy_config_service, self._privacy_sanitizer)
+                content = protected[0]["parts"][0].text
+            for _, messages in affected:
+                for message in messages:
+                    if message.id == message_id:
+                        if len(message.parts) != 1 or not isinstance(message.parts[0], TextPart):
+                            raise InvalidArgumentError("Only plain text messages can be corrected")
+                        message.parts = [TextPart(content)]
+            archives = [(path.rsplit("/", 1)[0], messages) for path, messages in affected
+                        if "/history/" in path]
+            embedding = None
+            if archives:
+                from openviking.session.session import _embed_turn_texts
+                from openviking_cli.utils.config import get_openviking_config
+
+                embedder = get_openviking_config().embedding.get_embedder()
+                if embedder is not None:
+                    embedding = (await asyncio.to_thread(_embed_turn_texts, embedder, [content]))[0]
+            index_uri = session_uri.rsplit("/sessions/", 1)[0] + "/.index/evidence.json"
+            stage = "evidence_index"
+            async with evidence_index_lock(fs, index_uri, ctx) as index_lease:
+                index = await load_index(fs, index_uri, ctx, allow_pending=True)
+                index.invalidate_sources([message_id], session_uri)
+                indexed = index.resolve_sources([message_id])
+                if indexed and indexed[0]["uri"].rstrip("/") != session_uri:
+                    raise ConflictError("Message source belongs to another session")
+                if not indexed and archives:
+                    raise ConflictError("Archived message is missing from the evidence index; rebuild it first")
+                index.pending_source_updates = sorted(set(index.pending_source_updates) | {message_id})
+                await index.save(fs, index_uri, ctx, lease_ref=index_lease)
+                stage = "source_write"
+                for path, messages in affected:
+                    # Protect payloads above; never sanitize JSON keys or message IDs.
+                    await fs.write_file(path, ("\n".join(m.to_jsonl() for m in messages) + "\n").encode("utf-8"),
+                                        ctx=ctx, lease_ref=lease)
+                stage = "evidence_index_finalize"
+                if indexed:
+                    from openviking.message import Message
+                    from openviking.session.session import _EVIDENCE_SPEAKER_RE
+
+                    # Use the persisted text, including any configured sanitization.
+                    stored = await fs.read_file(affected[0][0], ctx=ctx)
+                    message = next(Message.from_dict(json.loads(line)) for line in stored.split("\n")
+                                   if json.loads(line).get("id") == message_id)
+                    match = _EVIDENCE_SPEAKER_RE.match(message.content)
+                    speaker = match.group(1).strip() if match else (message.peer_id or message.role)
+                    index.replace_source(message_id, message.content, speaker, message.created_at or "",
+                                         embedding if message.content == content else None)
+                index.pending_source_updates.remove(message_id)
+                index._dirty = True
+                await index.save(fs, index_uri, ctx, lease_ref=index_lease)
+                stage = "memory_cleanup"
+                cleanup = await cleanup_source_memories(fs, index, index_uri, index_lease,
+                                                        [message_id], ctx, vikingdb=self._vikingdb)
+            await session._reload()
+            await session._rebuild_pending_tokens()
+            await session._save_meta(lease_ref=lease)
+            stage = "reextract"
+            policy = await session._resolve_memory_policy()
+            memory_types = {"facts", "entities", "events"}
+            if policy.memory_types is not None:
+                memory_types &= set(policy.memory_types)
+            for archive_uri, messages in archives:
+                from openviking.message import Message
+
+                raw = await fs.read_file(archive_uri + "/messages.jsonl", ctx=ctx)
+                messages = [Message.from_dict(json.loads(line)) for line in raw.split("\n") if line.strip()]
+                # Only rebuild source memories. The full commit wrapper also
+                # trains agent memories and reacquires archive write locks.
+                result = await session._session_compressor._extract_user_memories(
+                    messages=messages, ctx=ctx, session_id=session_id,
+                    archive_uri=archive_uri, strict_extract_errors=True,
+                    allowed_memory_types=memory_types,
+                    allow_self_memory=policy.self_enabled, peer_memory_enabled=policy.peer_enabled,
+                    allowed_peer_ids={m.peer_id for m in messages if m.peer_id} if policy.peer_enabled else set())
+                if result.memory_diff is not None:
+                    await fs.write_file(archive_uri + "/memory_diff.json",
+                        json.dumps(result.memory_diff, ensure_ascii=False).encode("utf-8"),
+                        ctx=ctx, lease_ref=lease)
+            return dict(session_id=session_id, message_id=message_id,
+                        status="completed", cleanup=cleanup, reextracted=bool(archives))
+        except Exception as exc:
+            if stage == "prepare":
+                raise
+            from openviking.server.error_mapping import map_exception
+
+            error = map_exception(exc) or InternalError("Message correction failed")
+            error.details.update(stage=stage, session_id=session_id, message_id=message_id,
+                                 retry_same_correction=True)
+            if error is exc:
+                raise
+            raise error from exc
+        finally:
+            await fs._async_agfs.pathlock_release(lease)
 
     async def commit(
         self,
